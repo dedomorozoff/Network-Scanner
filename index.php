@@ -557,6 +557,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
         .btn-secondary {
             background: linear-gradient(135deg, #6c757d 0%, #495057 100%);
         }
+        .btn-danger {
+            background: linear-gradient(135deg, #dc3545 0%, #b02a37 100%);
+        }
         
         .progress-section {
             margin: 30px 0;
@@ -807,6 +810,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
                     <button type="submit" class="btn" id="scanBtn">
                         🚀 Начать сканирование
                     </button>
+                    <button type="button" class="btn btn-danger" id="stopBtn" style="display: none;">
+                        ⛔ Остановить
+                    </button>
                     <button type="button" class="btn btn-secondary" id="exportBtn" style="display: none;">
                         📊 Экспорт в CSV
                     </button>
@@ -847,6 +853,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
 
     <script>
         let scanData = null;
+        let currentEventSource = null;
         
         document.getElementById('scanForm').addEventListener('submit', function(e) {
             e.preventDefault();
@@ -871,12 +878,15 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
             const progressSection = document.getElementById('progressSection');
             const resultsSection = document.getElementById('resultsSection');
             const exportBtn = document.getElementById('exportBtn');
+            const stopBtn = document.getElementById('stopBtn');
             
             scanBtn.disabled = true;
             scanBtn.textContent = '⏳ Сканирование...';
             progressSection.style.display = 'block';
             resultsSection.style.display = 'none';
             exportBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
+            stopBtn.disabled = false;
             
             // Потоковый режим через SSE
             startStreamingScan(form);
@@ -891,6 +901,7 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
             const resultsList = document.getElementById('resultsList');
             const statsContainer = document.getElementById('statsContainer');
             const exportBtn = document.getElementById('exportBtn');
+            const stopBtn = document.getElementById('stopBtn');
 
             resultsList.innerHTML = '';
             statsContainer.innerHTML = '';
@@ -909,7 +920,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
             params.set('show_offline', form.show_offline.checked ? '1' : '0');
             if (form.source_ip.value) params.set('source_ip', form.source_ip.value);
 
+            if (currentEventSource) { try { currentEventSource.close(); } catch(e){} }
             const es = new EventSource('?' + params.toString());
+            currentEventSource = es;
 
             es.addEventListener('progress', (ev) => {
                 try {
@@ -949,9 +962,11 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
                     showError('Ошибка обработки завершения сканирования');
                 } finally {
                     es.close();
+                    if (currentEventSource === es) currentEventSource = null;
                     scanBtn.disabled = false;
                     scanBtn.textContent = '🚀 Начать сканирование';
                     progressSection.style.display = 'none';
+                    stopBtn.style.display = 'none';
                 }
             });
 
@@ -963,12 +978,28 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
                     showError('Ошибка при сканировании');
                 } finally {
                     es.close();
+                    if (currentEventSource === es) currentEventSource = null;
                     scanBtn.disabled = false;
                     scanBtn.textContent = '🚀 Начать сканирование';
                     progressSection.style.display = 'none';
+                    stopBtn.style.display = 'none';
                 }
             });
         }
+
+        // Кнопка Остановить: закрывает EventSource, UI возвращается в исходное состояние
+        document.getElementById('stopBtn')?.addEventListener('click', () => {
+            const stopBtn = document.getElementById('stopBtn');
+            const scanBtn = document.getElementById('scanBtn');
+            stopBtn.disabled = true;
+            stopBtn.textContent = '⏹ Остановка...';
+            try { if (currentEventSource) currentEventSource.close(); } catch(e) {}
+            currentEventSource = null;
+            scanBtn.disabled = false;
+            scanBtn.textContent = '🚀 Начать сканирование';
+            document.getElementById('progressSection').style.display = 'none';
+            stopBtn.style.display = 'none';
+        });
 
         function renderStats(stats) {
             const statsContainer = document.getElementById('statsContainer');
