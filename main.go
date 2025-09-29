@@ -338,21 +338,6 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		case "log_download":
 			http.ServeFile(w, r, logPath)
 			return
-		case "vnc_connect":
-			ip := r.FormValue("ip")
-			if ip == "" {
-				json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "IP адрес не указан"})
-				return
-			}
-			err := startVNCClient(ip)
-			if err != nil {
-				logEvent("VNC_ERROR", map[string]any{"ip": ip, "error": err.Error()})
-				json.NewEncoder(w).Encode(map[string]any{"success": false, "error": err.Error()})
-			} else {
-				logEvent("VNC_START", map[string]any{"ip": ip})
-				json.NewEncoder(w).Encode(map[string]any{"success": true})
-			}
-			return
 		}
 	}
 
@@ -490,98 +475,20 @@ forLoop:
 	flusher.Flush()
 }
 
-func startVNCClient(ip string) error {
-	// Попытка найти VNC клиент в системе
-	var vncClient string
-	var args []string
-	
-	// Проверяем различные VNC клиенты в зависимости от ОС
-	if runtime.GOOS == "windows" {
-		// Попробуем найти TightVNC, UltraVNC, RealVNC или другие популярные клиенты
-		possibleClients := []string{
-			"vncviewer.exe",
-			"tightvnc.exe", 
-			"ultravnc.exe",
-			"realvnc.exe",
-		}
-		
-		for _, client := range possibleClients {
-			if _, err := exec.LookPath(client); err == nil {
-				vncClient = client
-				args = []string{ip}
-				break
-			}
-		}
-		
-		// Если не найден в PATH, попробуем стандартные пути
-		if vncClient == "" {
-			standardPaths := []string{
-				`C:\Program Files\TightVNC\vncviewer.exe`,
-				`C:\Program Files (x86)\TightVNC\vncviewer.exe`,
-				`C:\Program Files\UltraVNC\vncviewer.exe`,
-				`C:\Program Files (x86)\UltraVNC\vncviewer.exe`,
-				`C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe`,
-				`C:\Program Files (x86)\RealVNC\VNC Viewer\vncviewer.exe`,
-			}
-			
-			for _, path := range standardPaths {
-				if _, err := os.Stat(path); err == nil {
-					vncClient = path
-					args = []string{ip}
-					break
-				}
-			}
-		}
-	} else {
-		// Linux/macOS/BSD
-		possibleClients := []string{
-			"vncviewer",
-			"xtightvncviewer", 
-			"x11vnc",
-			"tigervnc",
-		}
-		
-		for _, client := range possibleClients {
-			if _, err := exec.LookPath(client); err == nil {
-				vncClient = client
-				args = []string{ip}
-				break
-			}
-		}
-	}
-	
-	if vncClient == "" {
-		return fmt.Errorf("VNC клиент не найден. Установите TightVNC, UltraVNC, RealVNC или другой VNC клиент")
-	}
-	
-	// Запускаем VNC клиент
-	cmd := exec.Command(vncClient, args...)
-	err := cmd.Start()
-	if err != nil {
-		return fmt.Errorf("не удалось запустить VNC клиент: %v", err)
-	}
-	
-	// Даем процессу время на запуск
-	go func() {
-		time.Sleep(2 * time.Second)
-		if cmd.Process != nil {
-			// Проверяем, что процесс все еще работает
-			if err := cmd.Process.Signal(os.Signal(os.Kill)); err != nil {
-				// Процесс уже завершился или не может быть завершен
-			}
-		}
-	}()
-	
-	return nil
-}
 
 func toJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
 }
 
+func handleNoVNC(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, noVNCHTML)
+}
+
 func main() {
 	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/novnc", handleNoVNC)
 	addr := os.Getenv("ADDR")
 	if addr == "" {
 		addr = "0.0.0.0:8080"
@@ -589,6 +496,330 @@ func main() {
 	log.Printf("Server started at http://%s (listening on all interfaces)\n", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
+
+const noVNCHTML = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>noVNC - VNC клиент</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh; 
+            display: flex; 
+            flex-direction: column; 
+        }
+        .header { 
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); 
+            color: white; 
+            padding: 20px; 
+            text-align: center; 
+        }
+        .header h1 { font-size: 2em; margin-bottom: 10px; }
+        .controls { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 10px; 
+            margin: 20px; 
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
+        }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: 600; color: #333; }
+        .form-group input { 
+            width: 100%; 
+            padding: 10px; 
+            border: 2px solid #e1e5e9; 
+            border-radius: 5px; 
+            font-size: 16px; 
+        }
+        .btn { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            color: white; 
+            border: none; 
+            padding: 12px 24px; 
+            border-radius: 5px; 
+            font-size: 16px; 
+            font-weight: 600; 
+            cursor: pointer; 
+            margin-right: 10px; 
+        }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .btn-danger { background: linear-gradient(135deg, #dc3545 0%, #b02a37 100%); }
+        .vnc-container { 
+            flex: 1; 
+            margin: 20px; 
+            background: white; 
+            border-radius: 10px; 
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
+            overflow: hidden; 
+            display: flex; 
+            flex-direction: column; 
+        }
+        .vnc-header { 
+            background: #f8f9fa; 
+            padding: 15px 20px; 
+            border-bottom: 2px solid #e1e5e9; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
+        .vnc-canvas { 
+            flex: 1; 
+            background: #000; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            color: white; 
+            font-size: 18px; 
+        }
+        .status { 
+            padding: 10px 20px; 
+            background: #f8f9fa; 
+            border-top: 1px solid #e1e5e9; 
+            font-size: 14px; 
+            color: #666; 
+        }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+        .status.connecting { background: #fff3cd; color: #856404; }
+        #noVNC_canvas { 
+            max-width: 100%; 
+            max-height: 100%; 
+            border: none; 
+        }
+        .loading { text-align: center; padding: 40px; }
+        .error { 
+            background: #f8d7da; 
+            color: #721c24; 
+            padding: 15px; 
+            border-radius: 5px; 
+            margin: 10px 0; 
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🖥️ noVNC - Веб VNC клиент</h1>
+        <p>Подключение к удаленному рабочему столу через браузер</p>
+    </div>
+    
+    <div class="controls">
+        <div class="form-group">
+            <label for="vncHost">VNC сервер (IP адрес):</label>
+            <input type="text" id="vncHost" placeholder="192.168.1.100" value="">
+        </div>
+        <div class="form-group">
+            <label for="vncPort">Порт VNC:</label>
+            <input type="number" id="vncPort" placeholder="5900" value="5900">
+        </div>
+        <div class="form-group">
+            <label for="vncPassword">Пароль VNC (если требуется):</label>
+            <input type="password" id="vncPassword" placeholder="Оставьте пустым, если пароль не требуется">
+        </div>
+        <button class="btn" id="connectBtn" onclick="connectVNC()">🔗 Подключиться</button>
+        <button class="btn btn-danger" id="disconnectBtn" onclick="disconnectVNC()" disabled>❌ Отключиться</button>
+    </div>
+    
+    <div class="vnc-container">
+        <div class="vnc-header">
+            <div>
+                <strong>VNC подключение:</strong> <span id="connectionInfo">Не подключено</span>
+            </div>
+            <div>
+                <button class="btn" onclick="toggleFullscreen()" id="fullscreenBtn">⛶ Полный экран</button>
+            </div>
+        </div>
+        <div class="vnc-canvas" id="vncCanvas">
+            <div class="loading" id="loadingMessage">
+                <div>🖥️ Готов к подключению</div>
+                <div style="font-size: 14px; margin-top: 10px; opacity: 0.7;">
+                    Введите данные VNC сервера и нажмите "Подключиться"
+                </div>
+            </div>
+        </div>
+        <div class="status" id="statusBar">
+            Статус: Ожидание подключения
+        </div>
+    </div>
+
+    <!-- noVNC библиотеки -->
+    <script src="https://cdn.jsdelivr.net/npm/novnc@1.4.0/lib/novnc.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/webrtc-adapter@8.2.3/adapter.min.js"></script>
+    
+    <script>
+        let rfb = null;
+        let isConnected = false;
+        
+        // Получаем параметры из URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const host = urlParams.get('host');
+        const port = urlParams.get('port') || '5900';
+        const password = urlParams.get('password') || '';
+        
+        // Заполняем форму, если параметры переданы
+        if (host) {
+            document.getElementById('vncHost').value = host;
+            document.getElementById('vncPort').value = port;
+            document.getElementById('vncPassword').value = password;
+        }
+        
+        function connectVNC() {
+            const host = document.getElementById('vncHost').value.trim();
+            const port = document.getElementById('vncPort').value.trim();
+            const password = document.getElementById('vncPassword').value;
+            
+            if (!host) {
+                showError('Введите IP адрес VNC сервера');
+                return;
+            }
+            
+            if (isConnected) {
+                disconnectVNC();
+                return;
+            }
+            
+            setStatus('connecting', 'Подключение к ' + host + ':' + port + '...');
+            document.getElementById('connectBtn').disabled = true;
+            document.getElementById('disconnectBtn').disabled = false;
+            
+            const url = 'ws://' + host + ':' + port;
+            const canvas = document.getElementById('vncCanvas');
+            
+            // Очищаем canvas
+            canvas.innerHTML = '';
+            
+            try {
+                rfb = new RFB(canvas, url, {
+                    credentials: { password: password }
+                });
+                
+                rfb.addEventListener('connect', onConnect);
+                rfb.addEventListener('disconnect', onDisconnect);
+                rfb.addEventListener('credentialsrequired', onCredentialsRequired);
+                rfb.addEventListener('securityfailure', onSecurityFailure);
+                rfb.addEventListener('clipboard', onClipboard);
+                
+            } catch (error) {
+                showError('Ошибка подключения: ' + error.message);
+                setStatus('disconnected', 'Ошибка подключения');
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('disconnectBtn').disabled = true;
+            }
+        }
+        
+        function disconnectVNC() {
+            if (rfb) {
+                rfb.disconnect();
+                rfb = null;
+            }
+            isConnected = false;
+            setStatus('disconnected', 'Отключено');
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            document.getElementById('connectionInfo').textContent = 'Не подключено';
+            
+            // Показываем сообщение о готовности
+            const canvas = document.getElementById('vncCanvas');
+            canvas.innerHTML = \`
+                <div class="loading">
+                    <div>🖥️ Готов к подключению</div>
+                    <div style="font-size: 14px; margin-top: 10px; opacity: 0.7;">
+                        Введите данные VNC сервера и нажмите "Подключиться"
+                    </div>
+                </div>
+            \`;
+        }
+        
+        function onConnect() {
+            isConnected = true;
+            setStatus('connected', 'Подключено к ' + document.getElementById('vncHost').value + ':' + document.getElementById('vncPort').value);
+            document.getElementById('connectionInfo').textContent = document.getElementById('vncHost').value + ':' + document.getElementById('vncPort').value;
+            document.getElementById('connectBtn').textContent = '🔗 Переподключиться';
+        }
+        
+        function onDisconnect(e) {
+            isConnected = false;
+            if (e.detail.clean) {
+                setStatus('disconnected', 'Отключено');
+            } else {
+                setStatus('disconnected', 'Соединение потеряно');
+                showError('Соединение потеряно: ' + (e.detail.reason || 'Неизвестная причина'));
+            }
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            document.getElementById('connectBtn').textContent = '🔗 Подключиться';
+        }
+        
+        function onCredentialsRequired(e) {
+            const password = document.getElementById('vncPassword').value;
+            if (password) {
+                rfb.sendCredentials({ password: password });
+            } else {
+                showError('Требуется пароль VNC');
+                disconnectVNC();
+            }
+        }
+        
+        function onSecurityFailure(e) {
+            showError('Ошибка безопасности: ' + (e.detail.reason || 'Неизвестная ошибка'));
+            disconnectVNC();
+        }
+        
+        function onClipboard(e) {
+            // Обработка буфера обмена
+            console.log('Clipboard data:', e.detail.text);
+        }
+        
+        function setStatus(type, message) {
+            const statusBar = document.getElementById('statusBar');
+            statusBar.className = 'status ' + type;
+            statusBar.textContent = 'Статус: ' + message;
+        }
+        
+        function showError(message) {
+            const canvas = document.getElementById('vncCanvas');
+            canvas.innerHTML = \`
+                <div class="error">
+                    <strong>Ошибка:</strong> \${message}
+                </div>
+            \`;
+        }
+        
+        function toggleFullscreen() {
+            const canvas = document.getElementById('vncCanvas');
+            if (!document.fullscreenElement) {
+                canvas.requestFullscreen().catch(err => {
+                    console.log('Ошибка входа в полноэкранный режим:', err);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+        
+        // Обработка клавиш
+        document.addEventListener('keydown', function(e) {
+            if (isConnected && rfb) {
+                // Передаем клавиши в VNC
+                if (e.key === 'F11') {
+                    e.preventDefault();
+                    toggleFullscreen();
+                }
+            }
+        });
+        
+        // Автоматическое подключение, если параметры переданы
+        if (host) {
+            setTimeout(() => {
+                connectVNC();
+            }, 1000);
+        }
+    </script>
+</body>
+</html>`
 
 const indexHTML = `<!DOCTYPE html>
 <html lang="ru">
@@ -834,21 +1065,16 @@ const indexHTML = `<!DOCTYPE html>
         function refreshLog(){ const lines=document.getElementById('logLines')?.value||'200'; const body=new URLSearchParams({action:'log_tail',lines}); fetch('',{method:'POST', body}).then(r=>r.json()).then(d=>{ const v=document.getElementById('logViewer'); if (v && d && typeof d.text==='string'){ v.textContent=d.text; v.scrollTop=v.scrollHeight; } }).catch(()=>{}); }
         function downloadLog(){ const body=new URLSearchParams({action:'log_download'}); fetch('',{method:'POST', body}).then(r=>r.blob()).then(b=>{ const url=URL.createObjectURL(b); const a=document.createElement('a'); a.href=url; a.download='network_scan.log'; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); document.body.removeChild(a); }).catch(()=>{}); }
         function connectVNC(ip) {
-            const body = new FormData();
-            body.append('action', 'vnc_connect');
-            body.append('ip', ip);
-            fetch('', { method: 'POST', body })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        alert('VNC клиент запущен для ' + ip);
-                    } else {
-                        alert('Ошибка запуска VNC: ' + (data.error || 'Неизвестная ошибка'));
-                    }
-                })
-                .catch(error => {
-                    alert('Ошибка подключения к серверу: ' + error.message);
-                });
+            // Открываем noVNC в новом окне
+            const novncUrl = '/novnc?host=' + encodeURIComponent(ip) + '&port=5900';
+            const novncWindow = window.open(novncUrl, 'noVNC_' + ip, 'width=1200,height=800,scrollbars=yes,resizable=yes');
+            
+            if (novncWindow) {
+                // Фокусируемся на новом окне
+                novncWindow.focus();
+            } else {
+                alert('Не удалось открыть noVNC. Возможно, браузер блокирует всплывающие окна.');
+            }
         }
         document.addEventListener('DOMContentLoaded', ()=>{ fetch('',{method:'POST', body:new URLSearchParams({action:'interfaces'})}).then(r=>r.json()).then(d=>{ const sel=document.getElementById('source_ip'); if (d && Array.isArray(d.interfaces)){ d.interfaces.forEach(iface=>{ const opt=document.createElement('option'); opt.value=iface.ip; opt.textContent=(iface.name || '') + ' — ' + iface.ip; sel.appendChild(opt); }); } }).catch(()=>{}); refreshLog(); });
     </script>
