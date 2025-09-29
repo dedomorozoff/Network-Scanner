@@ -338,6 +338,21 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 		case "log_download":
 			http.ServeFile(w, r, logPath)
 			return
+		case "vnc_connect":
+			ip := r.FormValue("ip")
+			if ip == "" {
+				json.NewEncoder(w).Encode(map[string]any{"success": false, "error": "IP адрес не указан"})
+				return
+			}
+			err := startVNCClient(ip)
+			if err != nil {
+				logEvent("VNC_ERROR", map[string]any{"ip": ip, "error": err.Error()})
+				json.NewEncoder(w).Encode(map[string]any{"success": false, "error": err.Error()})
+			} else {
+				logEvent("VNC_START", map[string]any{"ip": ip})
+				json.NewEncoder(w).Encode(map[string]any{"success": true})
+			}
+			return
 		}
 	}
 
@@ -475,6 +490,91 @@ forLoop:
 	flusher.Flush()
 }
 
+func startVNCClient(ip string) error {
+	// Попытка найти VNC клиент в системе
+	var vncClient string
+	var args []string
+	
+	// Проверяем различные VNC клиенты в зависимости от ОС
+	if runtime.GOOS == "windows" {
+		// Попробуем найти TightVNC, UltraVNC, RealVNC или другие популярные клиенты
+		possibleClients := []string{
+			"vncviewer.exe",
+			"tightvnc.exe", 
+			"ultravnc.exe",
+			"realvnc.exe",
+		}
+		
+		for _, client := range possibleClients {
+			if _, err := exec.LookPath(client); err == nil {
+				vncClient = client
+				args = []string{ip}
+				break
+			}
+		}
+		
+		// Если не найден в PATH, попробуем стандартные пути
+		if vncClient == "" {
+			standardPaths := []string{
+				`C:\Program Files\TightVNC\vncviewer.exe`,
+				`C:\Program Files (x86)\TightVNC\vncviewer.exe`,
+				`C:\Program Files\UltraVNC\vncviewer.exe`,
+				`C:\Program Files (x86)\UltraVNC\vncviewer.exe`,
+				`C:\Program Files\RealVNC\VNC Viewer\vncviewer.exe`,
+				`C:\Program Files (x86)\RealVNC\VNC Viewer\vncviewer.exe`,
+			}
+			
+			for _, path := range standardPaths {
+				if _, err := os.Stat(path); err == nil {
+					vncClient = path
+					args = []string{ip}
+					break
+				}
+			}
+		}
+	} else {
+		// Linux/macOS/BSD
+		possibleClients := []string{
+			"vncviewer",
+			"xtightvncviewer", 
+			"x11vnc",
+			"tigervnc",
+		}
+		
+		for _, client := range possibleClients {
+			if _, err := exec.LookPath(client); err == nil {
+				vncClient = client
+				args = []string{ip}
+				break
+			}
+		}
+	}
+	
+	if vncClient == "" {
+		return fmt.Errorf("VNC клиент не найден. Установите TightVNC, UltraVNC, RealVNC или другой VNC клиент")
+	}
+	
+	// Запускаем VNC клиент
+	cmd := exec.Command(vncClient, args...)
+	err := cmd.Start()
+	if err != nil {
+		return fmt.Errorf("не удалось запустить VNC клиент: %v", err)
+	}
+	
+	// Даем процессу время на запуск
+	go func() {
+		time.Sleep(2 * time.Second)
+		if cmd.Process != nil {
+			// Проверяем, что процесс все еще работает
+			if err := cmd.Process.Signal(os.Signal(os.Kill)); err != nil {
+				// Процесс уже завершился или не может быть завершен
+			}
+		}
+	}()
+	
+	return nil
+}
+
 func toJSON(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
@@ -542,6 +642,10 @@ const indexHTML = `<!DOCTYPE html>
         .result-ip { font-weight:600; color:#333; font-size:1.1em; }
         .result-hostname { color:#666; font-size:0.9em; margin-top:2px; }
         .result-time { color:#28a745; font-weight:600; font-size:0.9em; }
+        .result-actions { display:flex; gap:10px; align-items:center; }
+        .btn-vnc { background:linear-gradient(135deg, #17a2b8 0%, #138496 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
+        .btn-vnc:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .btn-vnc:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
         .loading { text-align:center; padding:40px; color:#666; }
         .alert { padding:15px; border-radius:8px; margin-bottom:20px; }
         .alert-error { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
@@ -704,13 +808,19 @@ const indexHTML = `<!DOCTYPE html>
             const item = document.createElement('div'); item.className='result-item';
             var hostnameHtml = (result.hostname && result.hostname !== 'Unknown' && result.hostname !== 'N/A') ? ('<div class="result-hostname">' + result.hostname + '</div>') : '';
             var timeHtml = result.response_time ? ('<div class="result-time">' + result.response_time + 'мс</div>') : '<div class="result-time">N/A</div>';
+            var vncButton = result.status === 'online' ? 
+                '<button class="btn-vnc" onclick="connectVNC(\'' + result.ip + '\')" title="Подключиться через VNC">🖥️ VNC</button>' : 
+                '<button class="btn-vnc" disabled title="Компьютер недоступен">🖥️ VNC</button>';
             item.innerHTML =
                 '<div class="status-indicator status-' + result.status + '"></div>' +
                 '<div class="result-info">' +
                     '<div class="result-ip">' + result.ip + '</div>' +
                     hostnameHtml +
                 '</div>' +
-                timeHtml;
+                '<div class="result-actions">' +
+                    timeHtml +
+                    vncButton +
+                '</div>';
             list.appendChild(item);
         }
         function displayResults(data){
@@ -723,6 +833,23 @@ const indexHTML = `<!DOCTYPE html>
         let lastLogRefresh=0; function throttleRefreshLog(){ const now=Date.now(); if (now-lastLogRefresh>1000){ lastLogRefresh=now; refreshLog(); } }
         function refreshLog(){ const lines=document.getElementById('logLines')?.value||'200'; const body=new URLSearchParams({action:'log_tail',lines}); fetch('',{method:'POST', body}).then(r=>r.json()).then(d=>{ const v=document.getElementById('logViewer'); if (v && d && typeof d.text==='string'){ v.textContent=d.text; v.scrollTop=v.scrollHeight; } }).catch(()=>{}); }
         function downloadLog(){ const body=new URLSearchParams({action:'log_download'}); fetch('',{method:'POST', body}).then(r=>r.blob()).then(b=>{ const url=URL.createObjectURL(b); const a=document.createElement('a'); a.href=url; a.download='network_scan.log'; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); document.body.removeChild(a); }).catch(()=>{}); }
+        function connectVNC(ip) {
+            const body = new FormData();
+            body.append('action', 'vnc_connect');
+            body.append('ip', ip);
+            fetch('', { method: 'POST', body })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('VNC клиент запущен для ' + ip);
+                    } else {
+                        alert('Ошибка запуска VNC: ' + (data.error || 'Неизвестная ошибка'));
+                    }
+                })
+                .catch(error => {
+                    alert('Ошибка подключения к серверу: ' + error.message);
+                });
+        }
         document.addEventListener('DOMContentLoaded', ()=>{ fetch('',{method:'POST', body:new URLSearchParams({action:'interfaces'})}).then(r=>r.json()).then(d=>{ const sel=document.getElementById('source_ip'); if (d && Array.isArray(d.interfaces)){ d.interfaces.forEach(iface=>{ const opt=document.createElement('option'); opt.value=iface.ip; opt.textContent=(iface.name || '') + ' — ' + iface.ip; sel.appendChild(opt); }); } }).catch(()=>{}); refreshLog(); });
     </script>
 </body>

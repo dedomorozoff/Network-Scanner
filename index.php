@@ -287,6 +287,98 @@ if (!function_exists('getHostnameByIP')) {
     }
 }
 
+// Функция для запуска VNC клиента
+if (!function_exists('startVNCClient')) {
+    function startVNCClient($ip) {
+        $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+        $vncClient = '';
+        $args = [$ip];
+        
+        if ($isWindows) {
+            // Попробуем найти VNC клиент в Windows
+            $possibleClients = [
+                'vncviewer.exe',
+                'tightvnc.exe', 
+                'ultravnc.exe',
+                'realvnc.exe',
+            ];
+            
+            foreach ($possibleClients as $client) {
+                $output = [];
+                exec("where $client 2>nul", $output);
+                if (!empty($output)) {
+                    $vncClient = $client;
+                    break;
+                }
+            }
+            
+            // Если не найден в PATH, попробуем стандартные пути
+            if (empty($vncClient)) {
+                $standardPaths = [
+                    'C:\\Program Files\\TightVNC\\vncviewer.exe',
+                    'C:\\Program Files (x86)\\TightVNC\\vncviewer.exe',
+                    'C:\\Program Files\\UltraVNC\\vncviewer.exe',
+                    'C:\\Program Files (x86)\\UltraVNC\\vncviewer.exe',
+                    'C:\\Program Files\\RealVNC\\VNC Viewer\\vncviewer.exe',
+                    'C:\\Program Files (x86)\\RealVNC\\VNC Viewer\\vncviewer.exe',
+                ];
+                
+                foreach ($standardPaths as $path) {
+                    if (file_exists($path)) {
+                        $vncClient = $path;
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Linux/macOS/BSD
+            $possibleClients = [
+                'vncviewer',
+                'xtightvncviewer', 
+                'x11vnc',
+                'tigervnc',
+            ];
+            
+            foreach ($possibleClients as $client) {
+                $output = [];
+                exec("which $client 2>/dev/null", $output);
+                if (!empty($output)) {
+                    $vncClient = $client;
+                    break;
+                }
+            }
+        }
+        
+        if (empty($vncClient)) {
+            return [
+                'success' => false,
+                'error' => 'VNC клиент не найден. Установите TightVNC, UltraVNC, RealVNC или другой VNC клиент'
+            ];
+        }
+        
+        // Запускаем VNC клиент
+        $command = escapeshellarg($vncClient) . ' ' . escapeshellarg($ip);
+        if ($isWindows) {
+            $command = "start /B $command";
+        } else {
+            $command .= ' &';
+        }
+        
+        $output = [];
+        $returnCode = 0;
+        exec($command, $output, $returnCode);
+        
+        if ($returnCode !== 0) {
+            return [
+                'success' => false,
+                'error' => 'Не удалось запустить VNC клиент: ' . implode(' ', $output)
+            ];
+        }
+        
+        return ['success' => true];
+    }
+}
+
 // Обработка AJAX запросов
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     header('Content-Type: application/json');
@@ -345,6 +437,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
             
             fclose($output);
+            exit;
+            
+        case 'vnc_connect':
+            $ip = $_POST['ip'] ?? '';
+            if (empty($ip)) {
+                echo json_encode(['success' => false, 'error' => 'IP адрес не указан']);
+                exit;
+            }
+            
+            $result = startVNCClient($ip);
+            if ($result['success']) {
+                logEvent('VNC_START', ['ip' => $ip]);
+                echo json_encode(['success' => true]);
+            } else {
+                logEvent('VNC_ERROR', ['ip' => $ip, 'error' => $result['error']]);
+                echo json_encode(['success' => false, 'error' => $result['error']]);
+            }
             exit;
     }
 }
@@ -697,6 +806,35 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
             font-size: 0.9em;
         }
         
+        .result-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .btn-vnc {
+            background: linear-gradient(135deg, #17a2b8 0%, #138496 100%);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .btn-vnc:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .btn-vnc:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
         .loading {
             text-align: center;
             padding: 40px;
@@ -1028,13 +1166,24 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
             const resultsList = document.getElementById('resultsList');
             const item = document.createElement('div');
             item.className = 'result-item';
+            const hostnameHtml = (result.hostname && result.hostname !== 'Unknown' && result.hostname !== 'N/A') ? 
+                `<div class="result-hostname">${result.hostname}</div>` : '';
+            const timeHtml = result.response_time ? 
+                `<div class="result-time">${result.response_time}мс</div>` : 
+                '<div class="result-time">N/A</div>';
+            const vncButton = result.status === 'online' ? 
+                `<button class="btn-vnc" onclick="connectVNC('${result.ip}')" title="Подключиться через VNC">🖥️ VNC</button>` : 
+                `<button class="btn-vnc" disabled title="Компьютер недоступен">🖥️ VNC</button>`;
             item.innerHTML = `
                 <div class="status-indicator status-${result.status}"></div>
                 <div class="result-info">
                     <div class="result-ip">${result.ip}</div>
-                    ${result.hostname && result.hostname !== 'Unknown' && result.hostname !== 'N/A' ? `<div class="result-hostname">${result.hostname}</div>` : ''}
+                    ${hostnameHtml}
                 </div>
-                ${result.response_time ? `<div class="result-time">${result.response_time}мс</div>` : '<div class="result-time">N/A</div>'}
+                <div class="result-actions">
+                    ${timeHtml}
+                    ${vncButton}
+                </div>
             `;
             resultsList.appendChild(item);
         }
@@ -1067,19 +1216,29 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
             if (data.results.length === 0) {
                 resultsList.innerHTML = '<div class="loading">Активные компьютеры не найдены</div>';
             } else {
-                resultsList.innerHTML = data.results.map(result => `
-                    <div class="result-item">
-                        <div class="status-indicator status-${result.status}"></div>
-                        <div class="result-info">
-                            <div class="result-ip">${result.ip}</div>
-                            ${result.hostname !== 'Unknown' && result.hostname !== 'N/A' ? 
-                                `<div class="result-hostname">${result.hostname}</div>` : ''}
+                resultsList.innerHTML = data.results.map(result => {
+                    const hostnameHtml = (result.hostname && result.hostname !== 'Unknown' && result.hostname !== 'N/A') ? 
+                        `<div class="result-hostname">${result.hostname}</div>` : '';
+                    const timeHtml = result.response_time ? 
+                        `<div class="result-time">${result.response_time}мс</div>` : 
+                        '<div class="result-time">N/A</div>';
+                    const vncButton = result.status === 'online' ? 
+                        `<button class="btn-vnc" onclick="connectVNC('${result.ip}')" title="Подключиться через VNC">🖥️ VNC</button>` : 
+                        `<button class="btn-vnc" disabled title="Компьютер недоступен">🖥️ VNC</button>`;
+                    return `
+                        <div class="result-item">
+                            <div class="status-indicator status-${result.status}"></div>
+                            <div class="result-info">
+                                <div class="result-ip">${result.ip}</div>
+                                ${hostnameHtml}
+                            </div>
+                            <div class="result-actions">
+                                ${timeHtml}
+                                ${vncButton}
+                            </div>
                         </div>
-                        ${result.response_time ? 
-                            `<div class="result-time">${result.response_time}мс</div>` : 
-                            '<div class="result-time">N/A</div>'}
-                    </div>
-                `).join('');
+                    `;
+                }).join('');
             }
             
             resultsSection.style.display = 'block';
@@ -1151,6 +1310,24 @@ if (isset($_GET['action']) && $_GET['action'] === 'scan_stream') {
                     document.body.removeChild(a);
                 })
                 .catch(() => {});
+        }
+        
+        function connectVNC(ip) {
+            const body = new FormData();
+            body.append('action', 'vnc_connect');
+            body.append('ip', ip);
+            fetch('', { method: 'POST', body })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('VNC клиент запущен для ' + ip);
+                    } else {
+                        alert('Ошибка запуска VNC: ' + (data.error || 'Неизвестная ошибка'));
+                    }
+                })
+                .catch(error => {
+                    alert('Ошибка подключения к серверу: ' + error.message);
+                });
         }
         
         function showError(message) {
