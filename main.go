@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 type ScanResult struct {
@@ -199,6 +201,155 @@ func resolveHostname(ctx context.Context, ip string) string {
 	return strings.TrimSuffix(names[0], ".")
 }
 
+func shutdownComputer(ip string) map[string]interface{} {
+	isWindows := runtime.GOOS == "windows"
+
+	if isWindows {
+		// Windows: используем PowerShell Stop-Computer
+		cmd := exec.Command("powershell", "-Command", "Stop-Computer -ComputerName "+ip+" -Force -Confirm:$false")
+		err := cmd.Run()
+		if err == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Команда выключения отправлена успешно",
+			}
+		}
+
+		// Попробуем через shutdown.exe как резервный метод
+		shutdownCmd := exec.Command("shutdown", "/s", "/m", "\\\\"+ip, "/t", "10", "/c", "Выключение по команде Network Scanner")
+		shutdownErr := shutdownCmd.Run()
+		if shutdownErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Команда выключения отправлена через shutdown.exe",
+			}
+		}
+	} else {
+		// Linux/Unix: используем ssh с sudo shutdown
+		cmd := exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", "root@"+ip, "sudo shutdown -h +1 \"Выключение по команде Network Scanner\"")
+		err := cmd.Run()
+		if err == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Команда выключения отправлена успешно",
+			}
+		}
+
+		// Попробуем через rsh
+		rshCmd := exec.Command("rsh", ip, "sudo shutdown -h +1")
+		rshErr := rshCmd.Run()
+		if rshErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Команда выключения отправлена через RSH",
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"success": false,
+		"error":   "Не удалось отправить команду выключения. Возможно, требуется настройка удаленного управления или отсутствуют права доступа.",
+	}
+}
+
+// WebSocket upgrader для VNC прокси
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Разрешаем все origin для локального использования
+	},
+}
+
+// VNC WebSocket прокси
+func vncProxyHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("VNC Proxy: получен запрос %s %s", r.Method, r.URL.String())
+
+	// Проверяем, что это WebSocket запрос
+	if !websocket.IsWebSocketUpgrade(r) {
+		log.Printf("VNC Proxy: не WebSocket запрос, заголовки: %v", r.Header)
+		http.Error(w, "Требуется WebSocket соединение", http.StatusBadRequest)
+		return
+	}
+
+	// Получаем параметры VNC сервера из query
+	vncHost := r.URL.Query().Get("host")
+	vncPort := r.URL.Query().Get("port")
+
+	if vncHost == "" {
+		vncHost = "localhost"
+	}
+	if vncPort == "" {
+		vncPort = "5900"
+	}
+
+	log.Printf("VNC Proxy: подключение к %s:%s", vncHost, vncPort)
+
+	// Обновляем HTTP соединение до WebSocket
+	wsConn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("VNC Proxy: ошибка обновления до WebSocket: %v", err)
+		return
+	}
+	defer wsConn.Close()
+	log.Printf("VNC Proxy: WebSocket соединение установлено")
+
+	// Подключаемся к VNC серверу после успешного WebSocket соединения
+	vncAddr := net.JoinHostPort(vncHost, vncPort)
+	vncConn, err := net.Dial("tcp", vncAddr)
+	if err != nil {
+		log.Printf("Не удалось подключиться к VNC серверу %s: %v", vncAddr, err)
+		wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "Не удалось подключиться к VNC серверу"))
+		return
+	}
+	defer vncConn.Close()
+
+	// Канал для завершения
+	done := make(chan struct{})
+	var once sync.Once
+
+	// Копируем данные от VNC сервера к WebSocket клиенту
+	go func() {
+		defer once.Do(func() { close(done) })
+		buffer := make([]byte, 4096)
+		for {
+			n, err := vncConn.Read(buffer)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("VNC Proxy: ошибка чтения от VNC: %v", err)
+				}
+				break
+			}
+			err = wsConn.WriteMessage(websocket.BinaryMessage, buffer[:n])
+			if err != nil {
+				log.Printf("VNC Proxy: ошибка записи в WebSocket: %v", err)
+				break
+			}
+		}
+	}()
+
+	// Копируем данные от WebSocket клиента к VNC серверу
+	go func() {
+		defer once.Do(func() { close(done) })
+		for {
+			_, message, err := wsConn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("VNC Proxy: ошибка чтения из WebSocket: %v", err)
+				}
+				break
+			}
+			_, err = vncConn.Write(message)
+			if err != nil {
+				log.Printf("VNC Proxy: ошибка записи в VNC: %v", err)
+				break
+			}
+		}
+	}()
+
+	// Ждем завершения одной из горутин
+	<-done
+	log.Printf("VNC Proxy: соединение завершено")
+}
+
 func listInterfaces() []InterfaceInfo {
 	isWindows := runtime.GOOS == "windows"
 	isBSD := runtime.GOOS == "freebsd" || runtime.GOOS == "openbsd" || runtime.GOOS == "netbsd" || runtime.GOOS == "darwin"
@@ -337,6 +488,21 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		case "log_download":
 			http.ServeFile(w, r, logPath)
+			return
+		case "shutdown":
+			ip := r.FormValue("ip")
+			if ip == "" {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "IP адрес не указан"})
+				return
+			}
+
+			result := shutdownComputer(ip)
+			if result["success"].(bool) {
+				logEvent("SHUTDOWN_SUCCESS", map[string]interface{}{"ip": ip, "message": result["message"]})
+			} else {
+				logEvent("SHUTDOWN_ERROR", map[string]interface{}{"ip": ip, "error": result["error"]})
+			}
+			json.NewEncoder(w).Encode(result)
 			return
 		}
 	}
@@ -480,8 +646,32 @@ func toJSON(v any) string {
 	return string(b)
 }
 
+func handleNoVNC(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	io.WriteString(w, noVNCHTML)
+}
+
+func handleVNCClient(w http.ResponseWriter, r *http.Request) {
+	// Читаем содержимое файла vnc_client.html
+	content, err := os.ReadFile("vnc_client.html")
+	if err != nil {
+		http.Error(w, "Файл vnc_client.html не найден", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write(content)
+}
+
 func main() {
 	http.HandleFunc("/", handleIndex)
+	http.HandleFunc("/novnc", handleNoVNC)
+	http.HandleFunc("/vnc_client.html", handleVNCClient)
+	http.HandleFunc("/websockify", vncProxyHandler)
+
+	// Статические файлы для noVNC
+	http.Handle("/novnc/", http.StripPrefix("/novnc/", http.FileServer(http.Dir("novnc/"))))
+
 	addr := os.Getenv("ADDR")
 	if addr == "" {
 		addr = "0.0.0.0:8080"
@@ -489,6 +679,319 @@ func main() {
 	log.Printf("Server started at http://%s (listening on all interfaces)\n", addr)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
+
+const noVNCHTML = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>noVNC - VNC клиент</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            min-height: 100vh; 
+            display: flex; 
+            flex-direction: column; 
+        }
+        .header { 
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); 
+            color: white; 
+            padding: 20px; 
+            text-align: center; 
+        }
+        .header h1 { font-size: 2em; margin-bottom: 10px; }
+        .controls { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 10px; 
+            margin: 20px; 
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
+        }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: 600; color: #333; }
+        .form-group input { 
+            width: 100%; 
+            padding: 10px; 
+            border: 2px solid #e1e5e9; 
+            border-radius: 5px; 
+            font-size: 16px; 
+        }
+        .btn { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            color: white; 
+            border: none; 
+            padding: 12px 24px; 
+            border-radius: 5px; 
+            font-size: 16px; 
+            font-weight: 600; 
+            cursor: pointer; 
+            margin-right: 10px; 
+        }
+        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .btn-danger { background: linear-gradient(135deg, #dc3545 0%, #b02a37 100%); }
+        .vnc-container { 
+            flex: 1; 
+            margin: 20px; 
+            background: white; 
+            border-radius: 10px; 
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1); 
+            overflow: hidden; 
+            display: flex; 
+            flex-direction: column; 
+        }
+        .vnc-header { 
+            background: #f8f9fa; 
+            padding: 15px 20px; 
+            border-bottom: 2px solid #e1e5e9; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
+        .vnc-canvas { 
+            flex: 1; 
+            background: #000; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+            color: white; 
+            font-size: 18px; 
+        }
+        .status { 
+            padding: 10px 20px; 
+            background: #f8f9fa; 
+            border-top: 1px solid #e1e5e9; 
+            font-size: 14px; 
+            color: #666; 
+        }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+        .status.connecting { background: #fff3cd; color: #856404; }
+        #noVNC_canvas { 
+            max-width: 100%; 
+            max-height: 100%; 
+            border: none; 
+        }
+        .loading { text-align: center; padding: 40px; }
+        .error { 
+            background: #f8d7da; 
+            color: #721c24; 
+            padding: 15px; 
+            border-radius: 5px; 
+            margin: 10px 0; 
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🖥️ noVNC - Веб VNC клиент</h1>
+        <p>Подключение к удаленному рабочему столу через браузер</p>
+    </div>
+    
+    <div class="controls">
+        <div class="form-group">
+            <label for="vncHost">VNC сервер (IP адрес):</label>
+            <input type="text" id="vncHost" placeholder="192.168.1.100" value="">
+        </div>
+        <div class="form-group">
+            <label for="vncPort">Порт VNC:</label>
+            <input type="number" id="vncPort" placeholder="5900" value="5900">
+        </div>
+        <div class="form-group">
+            <label for="vncPassword">Пароль VNC (если требуется):</label>
+            <input type="password" id="vncPassword" placeholder="Оставьте пустым, если пароль не требуется">
+        </div>
+        <button class="btn" id="connectBtn" onclick="connectVNC()">🔗 Подключиться</button>
+        <button class="btn btn-danger" id="disconnectBtn" onclick="disconnectVNC()" disabled>❌ Отключиться</button>
+    </div>
+    
+    <div class="vnc-container">
+        <div class="vnc-header">
+            <div>
+                <strong>VNC подключение:</strong> <span id="connectionInfo">Не подключено</span>
+            </div>
+            <div>
+                <button class="btn" onclick="toggleFullscreen()" id="fullscreenBtn">⛶ Полный экран</button>
+            </div>
+        </div>
+        <div class="vnc-canvas" id="vncCanvas">
+            <div class="loading" id="loadingMessage">
+                <div>🖥️ Готов к подключению</div>
+                <div style="font-size: 14px; margin-top: 10px; opacity: 0.7;">
+                    Введите данные VNC сервера и нажмите "Подключиться"
+                </div>
+            </div>
+        </div>
+        <div class="status" id="statusBar">
+            Статус: Ожидание подключения
+        </div>
+    </div>
+
+    <!-- noVNC библиотеки -->
+    <script src="https://cdn.jsdelivr.net/npm/novnc@1.4.0/lib/novnc.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/webrtc-adapter@8.2.3/adapter.min.js"></script>
+    
+    <script>
+        let rfb = null;
+        let isConnected = false;
+        
+        // Получаем параметры из URL
+        const urlParams = new URLSearchParams(window.location.search);
+        const host = urlParams.get('host');
+        const port = urlParams.get('port') || '5900';
+        const password = urlParams.get('password') || '';
+        
+        // Заполняем форму, если параметры переданы
+        if (host) {
+            document.getElementById('vncHost').value = host;
+            document.getElementById('vncPort').value = port;
+            document.getElementById('vncPassword').value = password;
+        }
+        
+        function connectVNC() {
+            const host = document.getElementById('vncHost').value.trim();
+            const port = document.getElementById('vncPort').value.trim();
+            const password = document.getElementById('vncPassword').value;
+            
+            if (!host) {
+                showError('Введите IP адрес VNC сервера');
+                return;
+            }
+            
+            if (isConnected) {
+                disconnectVNC();
+                return;
+            }
+            
+            setStatus('connecting', 'Подключение к ' + host + ':' + port + '...');
+            document.getElementById('connectBtn').disabled = true;
+            document.getElementById('disconnectBtn').disabled = false;
+            
+            const url = 'ws://' + host + ':' + port;
+            const canvas = document.getElementById('vncCanvas');
+            
+            // Очищаем canvas
+            canvas.innerHTML = '';
+            
+            try {
+                rfb = new RFB(canvas, url, {
+                    credentials: { password: password }
+                });
+                
+                rfb.addEventListener('connect', onConnect);
+                rfb.addEventListener('disconnect', onDisconnect);
+                rfb.addEventListener('credentialsrequired', onCredentialsRequired);
+                rfb.addEventListener('securityfailure', onSecurityFailure);
+                rfb.addEventListener('clipboard', onClipboard);
+                
+            } catch (error) {
+                showError('Ошибка подключения: ' + error.message);
+                setStatus('disconnected', 'Ошибка подключения');
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('disconnectBtn').disabled = true;
+            }
+        }
+        
+        function disconnectVNC() {
+            if (rfb) {
+                rfb.disconnect();
+                rfb = null;
+            }
+            isConnected = false;
+            setStatus('disconnected', 'Отключено');
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            document.getElementById('connectionInfo').textContent = 'Не подключено';
+            
+            // Показываем сообщение о готовности
+            const canvas = document.getElementById('vncCanvas');
+            canvas.innerHTML = '<div class="loading"><div>Готов к подключению</div><div style="font-size: 14px; margin-top: 10px; opacity: 0.7;">Введите данные VNC сервера и нажмите "Подключиться"</div></div>';
+        }
+        
+        function onConnect() {
+            isConnected = true;
+            setStatus('connected', 'Подключено к ' + document.getElementById('vncHost').value + ':' + document.getElementById('vncPort').value);
+            document.getElementById('connectionInfo').textContent = document.getElementById('vncHost').value + ':' + document.getElementById('vncPort').value;
+            document.getElementById('connectBtn').textContent = '🔗 Переподключиться';
+        }
+        
+        function onDisconnect(e) {
+            isConnected = false;
+            if (e.detail.clean) {
+                setStatus('disconnected', 'Отключено');
+            } else {
+                setStatus('disconnected', 'Соединение потеряно');
+                showError('Соединение потеряно: ' + (e.detail.reason || 'Неизвестная причина'));
+            }
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            document.getElementById('connectBtn').textContent = '🔗 Подключиться';
+        }
+        
+        function onCredentialsRequired(e) {
+            const password = document.getElementById('vncPassword').value;
+            if (password) {
+                rfb.sendCredentials({ password: password });
+            } else {
+                showError('Требуется пароль VNC');
+                disconnectVNC();
+            }
+        }
+        
+        function onSecurityFailure(e) {
+            showError('Ошибка безопасности: ' + (e.detail.reason || 'Неизвестная ошибка'));
+            disconnectVNC();
+        }
+        
+        function onClipboard(e) {
+            // Обработка буфера обмена
+            console.log('Clipboard data:', e.detail.text);
+        }
+        
+        function setStatus(type, message) {
+            const statusBar = document.getElementById('statusBar');
+            statusBar.className = 'status ' + type;
+            statusBar.textContent = 'Статус: ' + message;
+        }
+        
+        function showError(message) {
+            const canvas = document.getElementById('vncCanvas');
+            canvas.innerHTML = '<div class="error"><strong>Ошибка:</strong> ' + message + '</div>';
+        }
+        
+        function toggleFullscreen() {
+            const canvas = document.getElementById('vncCanvas');
+            if (!document.fullscreenElement) {
+                canvas.requestFullscreen().catch(err => {
+                    console.log('Ошибка входа в полноэкранный режим:', err);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+        
+        // Обработка клавиш
+        document.addEventListener('keydown', function(e) {
+            if (isConnected && rfb) {
+                // Передаем клавиши в VNC
+                if (e.key === 'F11') {
+                    e.preventDefault();
+                    toggleFullscreen();
+                }
+            }
+        });
+        
+        // Автоматическое подключение, если параметры переданы
+        if (host) {
+            setTimeout(() => {
+                connectVNC();
+            }, 1000);
+        }
+    </script>
+</body>
+</html>`
 
 const indexHTML = `<!DOCTYPE html>
 <html lang="ru">
@@ -542,6 +1045,13 @@ const indexHTML = `<!DOCTYPE html>
         .result-ip { font-weight:600; color:#333; font-size:1.1em; }
         .result-hostname { color:#666; font-size:0.9em; margin-top:2px; }
         .result-time { color:#28a745; font-weight:600; font-size:0.9em; }
+        .result-actions { display:flex; gap:10px; align-items:center; }
+        .btn-vnc { background:linear-gradient(135deg, #17a2b8 0%, #138496 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
+        .btn-vnc:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .btn-vnc:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
+        .btn-shutdown { background:linear-gradient(135deg, #dc3545 0%, #b02a37 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
+        .btn-shutdown:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .btn-shutdown:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
         .loading { text-align:center; padding:40px; color:#666; }
         .alert { padding:15px; border-radius:8px; margin-bottom:20px; }
         .alert-error { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
@@ -704,13 +1214,23 @@ const indexHTML = `<!DOCTYPE html>
             const item = document.createElement('div'); item.className='result-item';
             var hostnameHtml = (result.hostname && result.hostname !== 'Unknown' && result.hostname !== 'N/A') ? ('<div class="result-hostname">' + result.hostname + '</div>') : '';
             var timeHtml = result.response_time ? ('<div class="result-time">' + result.response_time + 'мс</div>') : '<div class="result-time">N/A</div>';
+            var vncButton = result.status === 'online' ? 
+                '<button class="btn-vnc" onclick="connectVNC(\'' + result.ip + '\')" title="Подключиться через VNC">🖥️ VNC</button>' : 
+                '<button class="btn-vnc" disabled title="Компьютер недоступен">🖥️ VNC</button>';
+            var shutdownButton = result.status === 'online' ? 
+                '<button class="btn-shutdown" onclick="shutdownComputer(\'' + result.ip + '\')" title="Выключить компьютер">🔌 Выключить</button>' : 
+                '<button class="btn-shutdown" disabled title="Компьютер недоступен">🔌 Выключить</button>';
             item.innerHTML =
                 '<div class="status-indicator status-' + result.status + '"></div>' +
                 '<div class="result-info">' +
                     '<div class="result-ip">' + result.ip + '</div>' +
                     hostnameHtml +
                 '</div>' +
-                timeHtml;
+                '<div class="result-actions">' +
+                    timeHtml +
+                    vncButton +
+                    shutdownButton +
+                '</div>';
             list.appendChild(item);
         }
         function displayResults(data){
@@ -723,6 +1243,44 @@ const indexHTML = `<!DOCTYPE html>
         let lastLogRefresh=0; function throttleRefreshLog(){ const now=Date.now(); if (now-lastLogRefresh>1000){ lastLogRefresh=now; refreshLog(); } }
         function refreshLog(){ const lines=document.getElementById('logLines')?.value||'200'; const body=new URLSearchParams({action:'log_tail',lines}); fetch('',{method:'POST', body}).then(r=>r.json()).then(d=>{ const v=document.getElementById('logViewer'); if (v && d && typeof d.text==='string'){ v.textContent=d.text; v.scrollTop=v.scrollHeight; } }).catch(()=>{}); }
         function downloadLog(){ const body=new URLSearchParams({action:'log_download'}); fetch('',{method:'POST', body}).then(r=>r.blob()).then(b=>{ const url=URL.createObjectURL(b); const a=document.createElement('a'); a.href=url; a.download='network_scan.log'; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); document.body.removeChild(a); }).catch(()=>{}); }
+        function connectVNC(ip) {
+            // Открываем VNC клиент в новом окне
+            const vncUrl = 'vnc_client.html?host=' + encodeURIComponent(ip) + '&port=5900';
+            const vncWindow = window.open(vncUrl, 'VNC_' + ip, 'width=1200,height=800,scrollbars=yes,resizable=yes');
+            
+            if (vncWindow) {
+                // Фокусируемся на новом окне
+                vncWindow.focus();
+            } else {
+                alert('Не удалось открыть VNC клиент. Возможно, браузер блокирует всплывающие окна.');
+            }
+        }
+        
+        function shutdownComputer(ip) {
+            if (!confirm('Вы уверены, что хотите выключить компьютер ' + ip + '?\\n\\nЭто действие нельзя отменить!')) {
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('action', 'shutdown');
+            formData.append('ip', ip);
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('Команда выключения отправлена на ' + ip + '\\n\\n' + (data.message || 'Компьютер будет выключен через несколько секунд.'));
+                } else {
+                    alert('Ошибка при выключении ' + ip + ':\\n' + (data.error || 'Неизвестная ошибка'));
+                }
+            })
+            .catch(error => {
+                alert('Ошибка при выключении ' + ip + ':\\n' + error.message);
+            });
+        }
         document.addEventListener('DOMContentLoaded', ()=>{ fetch('',{method:'POST', body:new URLSearchParams({action:'interfaces'})}).then(r=>r.json()).then(d=>{ const sel=document.getElementById('source_ip'); if (d && Array.isArray(d.interfaces)){ d.interfaces.forEach(iface=>{ const opt=document.createElement('option'); opt.value=iface.ip; opt.textContent=(iface.name || '') + ' — ' + iface.ip; sel.appendChild(opt); }); } }).catch(()=>{}); refreshLog(); });
     </script>
 </body>
