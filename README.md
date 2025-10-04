@@ -205,7 +205,7 @@ Network-Scanner/
 
 ## 👥 Авторы
 
-- **Ваше имя** - *Основной разработчик* - [GitHub](https://github.com/yourusername)
+- **dedomorozoff** - *Основной разработчик* - [GitHub](https://github.com/dedomorozoff)
 
 ## 🙏 Благодарности
 
@@ -213,14 +213,4 @@ Network-Scanner/
 - [Gorilla WebSocket](https://github.com/gorilla/websocket) - за WebSocket поддержку
 - Сообщество Go - за прекрасный язык программирования
 
-## 📞 Поддержка
 
-Если у вас есть вопросы или проблемы:
-
-- 📧 Email: your.email@example.com
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/Network-Scanner/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/yourusername/Network-Scanner/discussions)
-
----
-
-⭐ **Если проект был полезен, поставьте звезду!** ⭐
