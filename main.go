@@ -53,6 +53,16 @@ type InterfaceInfo struct {
 	IP   string `json:"ip"`
 }
 
+type ProcessInfo struct {
+	PID     int     `json:"PID"`
+	Name    string  `json:"Name"`
+	CPUP    float64 `json:"CPUP"`
+	MemP    float64 `json:"MemP"`
+	CmdLine string  `json:"CmdLine"`
+	User    string  `json:"User"`
+	Status  string  `json:"Status"`
+}
+
 var (
 	logPath = filepath.Join(".", "network_scan.log")
 	mu      sync.Mutex
@@ -141,6 +151,13 @@ func parseRange(r string) []string {
 
 func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
 
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 func pingHost(ctx context.Context, ip string, timeoutMs int, sourceIP string) ScanResult {
 	start := time.Now()
 	isWindows := runtime.GOOS == "windows"
@@ -199,6 +216,201 @@ func resolveHostname(ctx context.Context, ip string) string {
 	}
 	// Trim trailing dot from FQDN if present
 	return strings.TrimSuffix(names[0], ".")
+}
+
+func getProcessesFromComputer(ip string) map[string]interface{} {
+	isWindows := runtime.GOOS == "windows"
+	var cmd *exec.Cmd
+
+	if isWindows {
+		// Упрощенная команда PowerShell для получения процессов
+		// Предлагаем два варианта: WMI и альтернативный метод
+		// Используем исправленный PowerShell скрипт
+
+		// Используем рабочий PowerShell скрипт для получения процессов
+		cmd = exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-NoProfile", "-File", "fix.ps1", "-ComputerName", ip)
+	} else {
+		// Linux/Unix: используем ssh с ps aux
+		cmd = exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+			fmt.Sprintf("root@%s", ip),
+			"ps aux --no-headers | awk '{print $2 \"|\" $11 \"|\" $3 \"|\" $4 \"|\" $1 \"|\" $8}'")
+	}
+
+	output, err := cmd.Output()
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Не удалось получить список процессов с %s: %v", ip, err),
+		}
+	}
+
+	if isWindows {
+		// Парсим JSON ответ от PowerShell скрипта
+		outputStr := strings.TrimSpace(string(output))
+
+		// Удаляем все символы управления кроме разрешенных
+		var cleanedStr strings.Builder
+		for _, r := range outputStr {
+			// Разрешенные символы: printable ASCII (32-126), табуляция (9), новая строка (10), возврат каретки (13)
+			if r >= 32 && r <= 126 || r == '\n' || r == '\r' || r == '\t' {
+				cleanedStr.WriteRune(r)
+			}
+		}
+		outputStr = cleanedStr.String()
+
+		// Удаляем возможные пробелы в начале и конце
+		outputStr = strings.TrimSpace(outputStr)
+
+		// Проверяем, что у нас есть валидный JSON
+		if outputStr == "" {
+			return map[string]interface{}{
+				"success": false,
+				"error":   "PowerShell script returned empty output",
+			}
+		}
+
+		// Проверяем, содержит ли вывод ошибку
+		if strings.Contains(outputStr, `"error"`) || strings.Contains(outputStr, `"success"`) {
+			var errorResult map[string]interface{}
+			if err := json.Unmarshal([]byte(outputStr), &errorResult); err == nil {
+				return errorResult
+			}
+		}
+
+		// Парсим успешный список процессов
+		var processes []ProcessInfo
+		if err := json.Unmarshal([]byte(outputStr), &processes); err != nil {
+			// Добавляем отладочную информацию
+			return map[string]interface{}{
+				"success": false,
+				"error":   fmt.Sprintf("Failed to parse processes JSON: %v", err),
+				"debug":   fmt.Sprintf("Output length: %d chars, first 200 chars: %s", len(outputStr), truncateString(outputStr, 200)),
+			}
+		}
+
+		return map[string]interface{}{
+			"success":   true,
+			"processes": processes,
+			"platform":  "windows",
+		}
+	} else {
+		// Парсим вывод ps aux для Linux
+		var processes []ProcessInfo
+		lines := strings.Split(string(output), "\n")
+
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			parts := strings.Split(line, "|")
+			if len(parts) >= 6 {
+				if pid, err := strconv.Atoi(parts[0]); err == nil && pid > 0 {
+					cpu, _ := strconv.ParseFloat(parts[2], 64)
+					mem, _ := strconv.ParseFloat(parts[3], 64)
+
+					processes = append(processes, ProcessInfo{
+						PID:     pid,
+						Name:    filepath.Base(parts[1]), // Получаем имя процесса из пути
+						CPUP:    cpu,
+						MemP:    mem,
+						CmdLine: parts[1],
+						User:    parts[4],
+						Status:  parts[5],
+					})
+				}
+			}
+		}
+
+		return map[string]interface{}{
+			"success":   true,
+			"processes": processes,
+			"platform":  "linux",
+		}
+	}
+}
+
+func killProcessOnComputer(ip string, pid int, processName string) map[string]interface{} {
+	isWindows := runtime.GOOS == "windows"
+
+	if isWindows {
+		// Windows: используем PowerShell для удаленного выполнения
+		// Сначала попробуем через WMI
+		cmd := exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-NoProfile",
+			"-Command", fmt.Sprintf("try { Invoke-WmiMethod -Class Win32_Process -Name Terminate -ArgumentList %d -ComputerName %s -ErrorAction Stop; Write-Host 'SUCCESS' } catch { Write-Host 'ERROR:' $_.Exception.Message }", pid, ip))
+		output, err := cmd.Output()
+		if err == nil && strings.Contains(string(output), "SUCCESS") {
+			return map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Процесс %s (PID: %d) успешно завершен через WMI", processName, pid),
+			}
+		}
+
+		// Попробуем через PowerShell Remoting
+		psCmd := exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-NoProfile",
+			"-Command", fmt.Sprintf("try { Invoke-Command -ComputerName %s -ScriptBlock { Stop-Process -Id %d -Force -ErrorAction Stop } -ErrorAction Stop; Write-Host 'SUCCESS' } catch { Write-Host 'ERROR:' $_.Exception.Message }", ip, pid))
+		psOutput, psErr := psCmd.Output()
+		if psErr == nil && strings.Contains(string(psOutput), "SUCCESS") {
+			return map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Процесс %s (PID: %d) завершен через PowerShell Remoting", processName, pid),
+			}
+		}
+
+		// Попробуем через wmic как альтернативу
+		wmicCmd := exec.Command("wmic", "/node:"+ip, "process", "where", fmt.Sprintf("ProcessId=%d", pid), "delete")
+		wmicOutput, wmicErr := wmicCmd.Output()
+		if wmicErr == nil && !strings.Contains(string(wmicOutput), "No Instance(s) Available") {
+			return map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Процесс %s (PID: %d) завершен через WMIC", processName, pid),
+			}
+		}
+
+		// Собираем детальную информацию об ошибках
+		var errorDetails []string
+		if err != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("WMI: %v", err))
+		}
+		if psErr != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("PowerShell Remoting: %v", psErr))
+		}
+		if wmicErr != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("WMIC: %v", wmicErr))
+		}
+
+		return map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Не удалось завершить процесс %s (PID: %d) на %s. Возможные причины: отсутствие прав доступа, процесс уже завершен, или удаленный компьютер недоступен. Детали ошибок: %s", processName, pid, ip, strings.Join(errorDetails, "; ")),
+		}
+	} else {
+		// Linux/Unix: используем ssh с kill
+		cmd := exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+			fmt.Sprintf("root@%s", ip), fmt.Sprintf("kill -9 %d", pid))
+		err := cmd.Run()
+		if err == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Процесс %s (PID: %d) успешно завершен", processName, pid),
+			}
+		}
+
+		// Попробуем через rsh
+		rshCmd := exec.Command("rsh", ip, fmt.Sprintf("kill -9 %d", pid))
+		rshErr := rshCmd.Run()
+		if rshErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Процесс %s (PID: %d) завершен через RSH", processName, pid),
+			}
+		}
+
+		return map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Не удалось завершить процесс %s (PID: %d) на %s. Возможные причины: отсутствие SSH доступа, процесс уже завершен, или недостаточно прав. Ошибки: SSH=%v, RSH=%v", processName, pid, ip, err, rshErr),
+		}
+	}
 }
 
 func shutdownComputer(ip string) map[string]interface{} {
@@ -501,6 +713,71 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 				logEvent("SHUTDOWN_SUCCESS", map[string]interface{}{"ip": ip, "message": result["message"]})
 			} else {
 				logEvent("SHUTDOWN_ERROR", map[string]interface{}{"ip": ip, "error": result["error"]})
+			}
+			json.NewEncoder(w).Encode(result)
+			return
+		case "processes":
+			ip := r.FormValue("ip")
+			if ip == "" {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "IP адрес не указан"})
+				return
+			}
+
+			// Сначала проверяем, что компьютер онлайн
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			res := pingHost(ctx, ip, 2000, "")
+			if res.Status != "online" {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   fmt.Sprintf("Компьютер %s недоступен. Статус: %s", ip, res.Status),
+				})
+				return
+			}
+
+			result := getProcessesFromComputer(ip)
+			if result["success"].(bool) {
+				logEvent("PROCESSES_SUCCESS", map[string]interface{}{"ip": ip, "count": len(result["processes"].([]ProcessInfo))})
+			} else {
+				logEvent("PROCESSES_ERROR", map[string]interface{}{"ip": ip, "error": result["error"]})
+			}
+			json.NewEncoder(w).Encode(result)
+			return
+		case "kill_process":
+			ip := r.FormValue("ip")
+			pidStr := r.FormValue("pid")
+			processName := r.FormValue("process_name")
+
+			if ip == "" || pidStr == "" || processName == "" {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Не все параметры указаны"})
+				return
+			}
+
+			pid, err := strconv.Atoi(pidStr)
+			if err != nil {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Неверный PID процесса"})
+				return
+			}
+
+			// Сначала проверяем, что компьютер онлайн
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			res := pingHost(ctx, ip, 2000, "")
+			if res.Status != "online" {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   fmt.Sprintf("Компьютер %s недоступен. Статус: %s", ip, res.Status),
+				})
+				return
+			}
+
+			result := killProcessOnComputer(ip, pid, processName)
+			if result["success"].(bool) {
+				logEvent("KILL_PROCESS_SUCCESS", map[string]interface{}{"ip": ip, "pid": pid, "process_name": processName, "message": result["message"]})
+			} else {
+				logEvent("KILL_PROCESS_ERROR", map[string]interface{}{"ip": ip, "pid": pid, "process_name": processName, "error": result["error"]})
 			}
 			json.NewEncoder(w).Encode(result)
 			return
@@ -1052,10 +1329,42 @@ const indexHTML = `<!DOCTYPE html>
         .btn-shutdown { background:linear-gradient(135deg, #dc3545 0%, #b02a37 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
         .btn-shutdown:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
         .btn-shutdown:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
+        .btn-processes { background:linear-gradient(135deg, #28a745 0%, #1e7e34 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
+        .btn-processes:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .btn-processes:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
         .loading { text-align:center; padding:40px; color:#666; }
         .alert { padding:15px; border-radius:8px; margin-bottom:20px; }
         .alert-error { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
         .alert-success { background:#d4edda; color:#155724; border:1px solid #c3e6cb; }
+        .modal { display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
+        .modal-content { background:white; margin:5% auto; padding:0; width:90%; max-width:900px; border-radius:10px; max-height:80vh; overflow:hidden; }
+        .modal-header { background:#f8f9fa; padding:15px 20px; border-bottom:2px solid #e1e5e9; display:flex; justify-content:space-between; align-items:center; }
+        .modal-title { font-weight:600; font-size:1.2em; color:#333; }
+        .modal-close { background:none; border:none; font-size:24px; cursor:pointer; color:#666; }
+        .modal-body { padding:0; max-height:60vh; overflow:auto; }
+        .process-controls { padding:15px 20px; background:#f8f9fa; border-bottom:1px solid #e1e5e9; display:flex; gap:15px; align-items:center; flex-wrap:wrap; }
+        .process-search { flex:1; min-width:200px; }
+        .process-search input { width:100%; padding:8px 12px; border:2px solid #e1e5e9; border-radius:6px; font-size:14px; }
+        .process-search input:focus { outline:none; border-color:#4facfe; }
+        .process-sort { display:flex; gap:10px; align-items:center; }
+        .process-sort select { padding:8px 12px; border:2px solid #e1e5e9; border-radius:6px; font-size:14px; background:white; }
+        .process-sort select:focus { outline:none; border-color:#4facfe; }
+        .process-table { width:100%; border-collapse:collapse; }
+        .process-table th, .process-table td { padding:8px 12px; text-align:left; border-bottom:1px solid #e1e5e9; }
+        .process-table th { background:#f8f9fa; font-weight:600; color:#333; cursor:pointer; user-select:none; }
+        .process-table th:hover { background:#e9ecef; }
+        .process-table th.sortable { position:relative; }
+        .process-table th.sortable::after { content:'↕'; position:absolute; right:8px; opacity:0.5; }
+        .process-table th.sort-asc::after { content:'↑'; opacity:1; }
+        .process-table th.sort-desc::after { content:'↓'; opacity:1; }
+        .process-table tr:hover { background:#f8f9fa; }
+        .process-pid { font-weight:600; color:#007bff; }
+        .process-cpu { color:#28a745; font-weight:600; }
+        .process-mem { color:#dc3545; font-weight:600; }
+        .btn-kill { background:linear-gradient(135deg, #dc3545 0%, #b02a37 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; min-width:40px; text-align:center; }
+        .btn-kill:hover { transform:translateY(-1px); box-shadow:0 4px 12px rgba(220,53,69,0.3); background:linear-gradient(135deg, #c82333 0%, #a71e2a 100%); }
+        .btn-kill:disabled { opacity:0.5; cursor:not-allowed; transform:none; background:#6c757d; box-shadow:none; }
+        .btn-kill:disabled:hover { transform:none; box-shadow:none; }
     </style>
 </head>
 <body>
@@ -1123,6 +1432,38 @@ const indexHTML = `<!DOCTYPE html>
             </div>
         </div>
     </div>
+    
+    <!-- Modal для отображения процессов -->
+    <div id="processModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title">🖥️ Процессы компьютера <span id="modalComputerIP"></span></h3>
+                <button class="modal-close" onclick="closeProcessModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="modalProcessesBody">
+                <div class="process-controls" id="processControls" style="display:none;">
+                    <div class="process-search">
+                        <input type="text" id="processSearchInput" placeholder="🔍 Поиск по названию процесса..." onkeyup="try{filterProcesses();}catch(e){console.error('Filter error:',e);}">
+                    </div>
+                    <div class="process-sort">
+                        <label for="processSortSelect">Сортировка:</label>
+                        <select id="processSortSelect" onchange="try{sortProcesses();}catch(e){console.error('Sort error:',e);}">
+                            <option value="name-asc">По названию (А-Я)</option>
+                            <option value="name-desc">По названию (Я-А)</option>
+                            <option value="pid-desc">По PID (убывание)</option>
+                            <option value="pid-asc">По PID (возрастание)</option>
+                            <option value="cpu-desc">По CPU (убывание)</option>
+                            <option value="cpu-asc">По CPU (возрастание)</option>
+                            <option value="mem-desc">По памяти (убывание)</option>
+                            <option value="mem-asc">По памяти (возрастание)</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="loading">Загрузка процессов...</div>
+            </div>
+        </div>
+    </div>
+    
     <script>
         let scanData = null;
         let currentEventSource = null;
@@ -1217,6 +1558,9 @@ const indexHTML = `<!DOCTYPE html>
             var vncButton = result.status === 'online' ? 
                 '<button class="btn-vnc" onclick="connectVNC(\'' + result.ip + '\')" title="Подключиться через VNC">🖥️ VNC</button>' : 
                 '<button class="btn-vnc" disabled title="Компьютер недоступен">🖥️ VNC</button>';
+            var processesButton = result.status === 'online' ? 
+                '<button class="btn-processes" onclick="showProcesses(\'' + result.ip + '\')" title="Показать процессы">📋 Процессы</button>' : 
+                '<button class="btn-processes" disabled title="Компьютер недоступен">📋 Процессы</button>';
             var shutdownButton = result.status === 'online' ? 
                 '<button class="btn-shutdown" onclick="shutdownComputer(\'' + result.ip + '\')" title="Выключить компьютер">🔌 Выключить</button>' : 
                 '<button class="btn-shutdown" disabled title="Компьютер недоступен">🔌 Выключить</button>';
@@ -1229,6 +1573,7 @@ const indexHTML = `<!DOCTYPE html>
                 '<div class="result-actions">' +
                     timeHtml +
                     vncButton +
+                    processesButton +
                     shutdownButton +
                 '</div>';
             list.appendChild(item);
@@ -1236,7 +1581,13 @@ const indexHTML = `<!DOCTYPE html>
         function displayResults(data){
             const list = document.getElementById('resultsList');
             list.innerHTML = '';
-            if (!data.results.length) { list.innerHTML = '<div class="loading">Активные компьютеры не найдены</div>'; return; }
+            
+            // Проверяем, что data и data.results существуют
+            if (!data || !data.results || !Array.isArray(data.results) || data.results.length === 0) { 
+                list.innerHTML = '<div class="loading">Активные компьютеры не найдены</div>'; 
+                return; 
+            }
+            
             data.results.forEach(r => appendResultItem(r));
         }
         function exportToCSV(){ if (!scanData) return; const body = new FormData(); body.append('action','export'); body.append('data', JSON.stringify(scanData)); fetch('', { method:'POST', body }).then(r=>r.blob()).then(b=>{ const url=URL.createObjectURL(b); const a=document.createElement('a'); a.href=url; a.download='network_scan_'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.csv'; document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); document.body.removeChild(a); }).catch(()=>{}); }
@@ -1281,6 +1632,354 @@ const indexHTML = `<!DOCTYPE html>
                 alert('Ошибка при выключении ' + ip + ':\\n' + error.message);
             });
         }
+        
+        function showProcesses(ip) {
+            const modal = document.getElementById('processModal');
+            const modalBody = document.getElementById('modalProcessesBody');
+            const modalComputerIP = document.getElementById('modalComputerIP');
+            
+            // Очищаем предыдущие данные
+            currentProcesses = [];
+            currentPlatform = '';
+            
+            modalComputerIP.textContent = ip;
+            modal.style.display = 'block';
+            
+            // Скрываем элементы управления во время загрузки
+            const processControls = document.getElementById('processControls');
+            if (processControls) {
+                processControls.style.display = 'none';
+            }
+            
+            // Очищаем поля поиска и сортировки
+            const searchInput = document.getElementById('processSearchInput');
+            const sortSelect = document.getElementById('processSortSelect');
+            if (searchInput) searchInput.value = '';
+            if (sortSelect) sortSelect.value = 'name-asc';
+            
+            modalBody.innerHTML = '<div class="loading">📋 Загрузка процессов с ' + ip + '...</div>';
+            
+            const formData = new FormData();
+            formData.append('action', 'processes');
+            formData.append('ip', ip);
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+                }
+                return response.json();
+            })
+            .then(data => {
+                // Проверяем структуру ответа
+                if (!data) {
+                    throw new Error('Пустой ответ от сервера');
+                }
+                
+                if (data.success === true && data.processes) {
+                    if (Array.isArray(data.processes) && data.processes.length > 0) {
+                        modalBody.innerHTML = generateProcessTable(data.processes, data.platform || 'windows');
+                    } else {
+                        modalBody.innerHTML = '<div class="loading">📋 Процессы не найдены на ' + ip + '</div>';
+                    }
+                } else {
+                    const errorMsg = data.error || data.debug || 'Неизвестная ошибка';
+                    modalBody.innerHTML = '<div class="alert alert-error"><strong>Ошибка:</strong> ' + escapeHtml(errorMsg) + '</div>';
+                }
+            })
+            .catch(error => {
+                modalBody.innerHTML = '<div class="alert alert-error"><strong>Ошибка:</strong> ' + error.message + '</div>';
+            });
+        }
+        
+        let currentProcesses = [];
+        let currentPlatform = '';
+        
+        function generateProcessTable(processes, platform) {
+            // Проверяем, что processes существует и является массивом
+            if (!processes || !Array.isArray(processes)) {
+                return '<div class="alert alert-error"><strong>Ошибка:</strong> Данные процессов не получены</div>';
+            }
+            
+            // Сохраняем данные для фильтрации и сортировки
+            currentProcesses = processes;
+            currentPlatform = platform;
+            
+            // Показываем элементы управления
+            const processControls = document.getElementById('processControls');
+            if (processControls) {
+                processControls.style.display = 'flex';
+            }
+            
+            // Сбрасываем сортировку на значение по умолчанию
+            const sortSelect = document.getElementById('processSortSelect');
+            if (sortSelect) {
+                sortSelect.value = 'name-asc';
+            }
+            
+            // Применяем сортировку по умолчанию
+            const sortedProcesses = sortProcessesBy(currentProcesses, 'name-asc');
+            
+            let table = '<table class="process-table" id="processTable">';
+            
+            if (platform === 'windows') {
+                table += '<thead><tr><th class="sortable" onclick="try{sortByColumn(\'pid\');}catch(e){console.error(\'Sort error:\',e);}">PID</th><th class="sortable" onclick="try{sortByColumn(\'name\');}catch(e){console.error(\'Sort error:\',e);}">Имя процесса</th><th>Полный путь</th><th>Пользователь</th><th>Статус</th><th>Действия</th></tr></thead><tbody>';
+                
+                sortedProcesses.forEach(process => {
+                    // Безопасное получение значений с проверкой на undefined
+                    const pid = process.PID || 0;
+                    const name = process.Name || 'Unknown';
+                    const cmdLine = process.CmdLine || '';
+                    const user = process.User || 'N/A';
+                    const status = process.Status || 'Unknown';
+                    
+                    // Определяем, можно ли завершить процесс
+                    const canKill = pid > 0 && pid !== 0 && pid !== 4 && name !== 'System Idle Process' && name !== 'System';
+                    const killButton = canKill ? 
+                        '<button class="btn-kill" onclick="killProcess(' + pid + ', \'' + escapeHtml(name) + '\')" title="Завершить процесс">Завершить</button>' :
+                        '<button class="btn-kill" disabled title="Нельзя завершить системный процесс">Завершить</button>';
+                    
+                    table += '<tr>';
+                    table += '<td class="process-pid">' + pid + '</td>';
+                    table += '<td>' + escapeHtml(name) + '</td>';
+                    table += '<td title="' + escapeHtml(cmdLine) + '">' + escapeHtml(cmdLine.length > 50 ? cmdLine.substring(0, 50) + '...' : cmdLine) + '</td>';
+                    table += '<td>' + escapeHtml(user) + '</td>';
+                    table += '<td>' + escapeHtml(status) + '</td>';
+                    table += '<td>' + killButton + '</td>';
+                    table += '</tr>';
+                });
+            } else {
+                table += '<thead><tr><th class="sortable" onclick="try{sortByColumn(\'pid\');}catch(e){console.error(\'Sort error:\',e);}">PID</th><th class="sortable" onclick="try{sortByColumn(\'name\');}catch(e){console.error(\'Sort error:\',e);}">Имя процесса</th><th class="sortable" onclick="try{sortByColumn(\'cpu\');}catch(e){console.error(\'Sort error:\',e);}">CPU%</th><th class="sortable" onclick="try{sortByColumn(\'mem\');}catch(e){console.error(\'Sort error:\',e);}">Mem%</th><th>Пользователь</th><th>Статус</th><th>Действия</th></tr></thead><tbody>';
+                
+                sortedProcesses.forEach(process => {
+                    // Безопасное получение значений с проверкой на undefined
+                    const pid = process.PID || 0;
+                    const name = process.Name || 'Unknown';
+                    const cmdLine = process.CmdLine || '';
+                    const cpu = process.CPUP || 0;
+                    const mem = process.MemP || 0;
+                    const user = process.User || 'N/A';
+                    const status = process.Status || 'Unknown';
+                    
+                    // Определяем, можно ли завершить процесс
+                    const canKill = pid > 0 && pid !== 0 && pid !== 1 && name !== 'init' && name !== 'systemd';
+                    const killButton = canKill ? 
+                        '<button class="btn-kill" onclick="killProcess(' + pid + ', \'' + escapeHtml(name) + '\')" title="Завершить процесс">Завершить</button>' :
+                        '<button class="btn-kill" disabled title="Нельзя завершить системный процесс">Завершить</button>';
+                    
+                    table += '<tr>';
+                    table += '<td class="process-pid">' + pid + '</td>';
+                    table += '<td title="' + escapeHtml(cmdLine) + '">' + escapeHtml(name) + '</td>';
+                    table += '<td class="process-cpu">' + cpu.toFixed(1) + '%</td>';
+                    table += '<td class="process-mem">' + mem.toFixed(1) + '%</td>';
+                    table += '<td>' + escapeHtml(user) + '</td>';
+                    table += '<td>' + escapeHtml(status) + '</td>';
+                    table += '<td>' + killButton + '</td>';
+                    table += '</tr>';
+                });
+            }
+            
+            table += '</tbody></table>';
+            table += '<div style="padding: 15px; text-align: center; color: #666; font-size: 0.9em;">Найдено процессов: ' + sortedProcesses.length + '</div>';
+            table += '<div style="padding: 10px 15px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 5px; margin: 10px; font-size: 0.85em; color: #856404;">';
+            table += '<strong>⚠️ Важно:</strong> Для завершения процессов на удаленных компьютерах требуются права администратора и настроенное удаленное управление (WMI, PowerShell Remoting, WMIC или SSH).';
+            table += '</div>';
+            
+            return table;
+        }
+        
+        function closeProcessModal() {
+            document.getElementById('processModal').style.display = 'none';
+            // Скрываем элементы управления при закрытии
+            const processControls = document.getElementById('processControls');
+            if (processControls) {
+                processControls.style.display = 'none';
+            }
+            // Очищаем поля поиска и сортировки
+            const searchInput = document.getElementById('processSearchInput');
+            const sortSelect = document.getElementById('processSortSelect');
+            if (searchInput) searchInput.value = '';
+            if (sortSelect) sortSelect.value = 'name-asc';
+            
+            // Очищаем данные процессов
+            currentProcesses = [];
+            currentPlatform = '';
+        }
+        
+        function filterProcesses() {
+            const searchInput = document.getElementById('processSearchInput');
+            const table = document.getElementById('processTable');
+            
+            if (!searchInput || !table) return;
+            
+            const searchTerm = searchInput.value.toLowerCase();
+            const rows = table.getElementsByTagName('tr');
+            let visibleCount = 0;
+            
+            for (let i = 1; i < rows.length; i++) { // Пропускаем заголовок
+                const cells = rows[i].getElementsByTagName('td');
+                if (cells.length > 0) {
+                    const processName = cells[1].textContent.toLowerCase(); // Имя процесса во втором столбце
+                    const shouldShow = processName.includes(searchTerm);
+                    if (rows[i] && rows[i].style) {
+                        rows[i].style.display = shouldShow ? '' : 'none';
+                    }
+                    if (shouldShow) visibleCount++;
+                }
+            }
+            
+            // Обновляем счетчик найденных процессов
+            const countElement = table.parentNode.querySelector('div[style*="padding: 15px"]');
+            if (countElement) {
+                countElement.textContent = 'Найдено процессов: ' + visibleCount;
+            }
+        }
+        
+        function sortProcesses() {
+            const sortSelect = document.getElementById('processSortSelect');
+            if (!sortSelect) return;
+            
+            const sortValue = sortSelect.value;
+            
+            if (!currentProcesses || currentProcesses.length === 0) return;
+            
+            const sortedProcesses = sortProcessesBy(currentProcesses, sortValue);
+            const modalBody = document.getElementById('modalProcessesBody');
+            
+            if (!modalBody) return;
+            
+            // Обновляем таблицу с отсортированными данными
+            modalBody.innerHTML = generateProcessTable(sortedProcesses, currentPlatform);
+        }
+        
+        function sortByColumn(column) {
+            const sortSelect = document.getElementById('processSortSelect');
+            if (!sortSelect) return;
+            
+            let newSortValue = '';
+            
+            switch (column) {
+                case 'pid':
+                    newSortValue = sortSelect.value === 'pid-desc' ? 'pid-asc' : 'pid-desc';
+                    break;
+                case 'name':
+                    newSortValue = sortSelect.value === 'name-desc' ? 'name-asc' : 'name-desc';
+                    break;
+                case 'cpu':
+                    newSortValue = sortSelect.value === 'cpu-desc' ? 'cpu-asc' : 'cpu-desc';
+                    break;
+                case 'mem':
+                    newSortValue = sortSelect.value === 'mem-desc' ? 'mem-asc' : 'mem-desc';
+                    break;
+            }
+            
+            if (newSortValue) {
+                sortSelect.value = newSortValue;
+                sortProcesses();
+            }
+        }
+        
+        function sortProcessesBy(processes, sortValue) {
+            if (!processes || !Array.isArray(processes)) return [];
+            
+            const sorted = [...processes]; // Создаем копию массива
+            
+            switch (sortValue) {
+                case 'name-asc':
+                    sorted.sort((a, b) => (a.Name || '').localeCompare(b.Name || '', 'ru'));
+                    break;
+                case 'name-desc':
+                    sorted.sort((a, b) => (b.Name || '').localeCompare(a.Name || '', 'ru'));
+                    break;
+                case 'pid-asc':
+                    sorted.sort((a, b) => (a.PID || 0) - (b.PID || 0));
+                    break;
+                case 'pid-desc':
+                    sorted.sort((a, b) => (b.PID || 0) - (a.PID || 0));
+                    break;
+                case 'cpu-asc':
+                    sorted.sort((a, b) => (a.CPUP || 0) - (b.CPUP || 0));
+                    break;
+                case 'cpu-desc':
+                    sorted.sort((a, b) => (b.CPUP || 0) - (a.CPUP || 0));
+                    break;
+                case 'mem-asc':
+                    sorted.sort((a, b) => (a.MemP || 0) - (b.MemP || 0));
+                    break;
+                case 'mem-desc':
+                    sorted.sort((a, b) => (b.MemP || 0) - (a.MemP || 0));
+                    break;
+                default:
+                    // По умолчанию сортируем по имени по возрастанию
+                    sorted.sort((a, b) => (a.Name || '').localeCompare(b.Name || '', 'ru'));
+            }
+            
+            return sorted;
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text || '';
+            return div.innerHTML;
+        }
+        
+        function killProcess(pid, processName) {
+            if (!confirm('Вы уверены, что хотите завершить процесс "' + processName + '" (PID: ' + pid + ')?\\n\\nЭто действие нельзя отменить!')) {
+                return;
+            }
+            
+            // Получаем IP адрес компьютера из заголовка модального окна
+            const modalComputerIP = document.getElementById('modalComputerIP').textContent;
+            
+            const formData = new FormData();
+            formData.append('action', 'kill_process');
+            formData.append('ip', modalComputerIP);
+            formData.append('pid', pid);
+            formData.append('process_name', processName);
+            
+            // Показываем индикатор загрузки
+            const modalBody = document.getElementById('modalProcessesBody');
+            const originalContent = modalBody.innerHTML;
+            modalBody.innerHTML = '<div class="loading">⏳ Завершение процесса ' + processName + ' (PID: ' + pid + ')...</div>';
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.success) {
+                    alert('Процесс "' + processName + '" (PID: ' + pid + ') успешно завершен!\\n\\n' + (data.message || ''));
+                    // Обновляем список процессов
+                    showProcesses(modalComputerIP);
+                } else {
+                    const errorMsg = data.error || 'Неизвестная ошибка';
+                    alert('Ошибка при завершении процесса "' + processName + '" (PID: ' + pid + '):\\n\\n' + errorMsg);
+                    modalBody.innerHTML = originalContent;
+                }
+            })
+            .catch(error => {
+                alert('Ошибка при завершении процесса "' + processName + '":\\n' + error.message);
+                modalBody.innerHTML = originalContent;
+            });
+        }
+        
+        // Закрытие модального окна при клике вне его
+        window.addEventListener('click', function(event) {
+            const modal = document.getElementById('processModal');
+            if (event.target === modal) {
+                closeProcessModal();
+            }
+        });
+        
         document.addEventListener('DOMContentLoaded', ()=>{ fetch('',{method:'POST', body:new URLSearchParams({action:'interfaces'})}).then(r=>r.json()).then(d=>{ const sel=document.getElementById('source_ip'); if (d && Array.isArray(d.interfaces)){ d.interfaces.forEach(iface=>{ const opt=document.createElement('option'); opt.value=iface.ip; opt.textContent=(iface.name || '') + ' — ' + iface.ip; sel.appendChild(opt); }); } }).catch(()=>{}); refreshLog(); });
     </script>
 </body>
