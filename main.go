@@ -887,6 +887,7 @@ forLoop:
 		results = append(results, res)
 		logEvent("ENTRY", res)
 
+		// Применяем фильтрацию offline компьютеров только если showOffline = false
 		if !showOffline && res.Status != "online" {
 			fmt.Fprintf(w, "event: progress\n")
 			fmt.Fprintf(w, "data: %s\n\n", toJSON(map[string]any{
@@ -912,7 +913,20 @@ forLoop:
 	}
 	stats := ScanStats{Total: len(ips), Online: online, Offline: offline, Errors: errs, ScanTime: math.Round(time.Since(start).Seconds()*100) / 100}
 	logEvent("DONE", stats)
-	payload := ScanPayload{Results: results, Stats: stats}
+
+	// Применяем фильтрацию offline компьютеров к финальным результатам
+	finalResults := results
+	if !showOffline {
+		filtered := make([]ScanResult, 0, len(results))
+		for _, it := range results {
+			if it.Status == "online" {
+				filtered = append(filtered, it)
+			}
+		}
+		finalResults = filtered
+	}
+
+	payload := ScanPayload{Results: finalResults, Stats: stats}
 	fmt.Fprintf(w, "event: done\n")
 	fmt.Fprintf(w, "data: %s\n\n", toJSON(payload))
 	flusher.Flush()
@@ -1337,11 +1351,11 @@ const indexHTML = `<!DOCTYPE html>
         .alert-error { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
         .alert-success { background:#d4edda; color:#155724; border:1px solid #c3e6cb; }
         .modal { display:none; position:fixed; z-index:1000; left:0; top:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
-        .modal-content { background:white; margin:5% auto; padding:0; width:90%; max-width:900px; border-radius:10px; max-height:80vh; overflow:hidden; }
+        .modal-content { background:white; margin:3% auto; padding:0; width:95%; max-width:1400px; border-radius:10px; max-height:85vh; overflow:hidden; }
         .modal-header { background:#f8f9fa; padding:15px 20px; border-bottom:2px solid #e1e5e9; display:flex; justify-content:space-between; align-items:center; }
         .modal-title { font-weight:600; font-size:1.2em; color:#333; }
         .modal-close { background:none; border:none; font-size:24px; cursor:pointer; color:#666; }
-        .modal-body { padding:0; max-height:60vh; overflow:auto; }
+        .modal-body { padding:0; max-height:70vh; overflow:auto; }
         .process-controls { padding:15px 20px; background:#f8f9fa; border-bottom:1px solid #e1e5e9; display:flex; gap:15px; align-items:center; flex-wrap:wrap; }
         .process-search { flex:1; min-width:200px; }
         .process-search input { width:100%; padding:8px 12px; border:2px solid #e1e5e9; border-radius:6px; font-size:14px; }
@@ -1349,8 +1363,14 @@ const indexHTML = `<!DOCTYPE html>
         .process-sort { display:flex; gap:10px; align-items:center; }
         .process-sort select { padding:8px 12px; border:2px solid #e1e5e9; border-radius:6px; font-size:14px; background:white; }
         .process-sort select:focus { outline:none; border-color:#4facfe; }
-        .process-table { width:100%; border-collapse:collapse; }
-        .process-table th, .process-table td { padding:8px 12px; text-align:left; border-bottom:1px solid #e1e5e9; }
+        .process-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+        .process-table th, .process-table td { padding:10px 12px; text-align:left; border-bottom:1px solid #e1e5e9; word-wrap:break-word; }
+        .process-table th:nth-child(1), .process-table td:nth-child(1) { width:8%; } /* PID */
+        .process-table th:nth-child(2), .process-table td:nth-child(2) { width:20%; } /* Name */
+        .process-table th:nth-child(3), .process-table td:nth-child(3) { width:35%; } /* CmdLine/CPU */
+        .process-table th:nth-child(4), .process-table td:nth-child(4) { width:12%; } /* User/Mem */
+        .process-table th:nth-child(5), .process-table td:nth-child(5) { width:15%; } /* Status */
+        .process-table th:nth-child(6), .process-table td:nth-child(6) { width:10%; } /* Actions */
         .process-table th { background:#f8f9fa; font-weight:600; color:#333; cursor:pointer; user-select:none; }
         .process-table th:hover { background:#e9ecef; }
         .process-table th.sortable { position:relative; }
@@ -1361,7 +1381,7 @@ const indexHTML = `<!DOCTYPE html>
         .process-pid { font-weight:600; color:#007bff; }
         .process-cpu { color:#28a745; font-weight:600; }
         .process-mem { color:#dc3545; font-weight:600; }
-        .btn-kill { background:linear-gradient(135deg, #dc3545 0%, #b02a37 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:13px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; min-width:40px; text-align:center; }
+        .btn-kill { background:linear-gradient(135deg, #dc3545 0%, #b02a37 100%); color:white; border:none; padding:6px 12px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; min-width:70px; text-align:center; white-space:nowrap; }
         .btn-kill:hover { transform:translateY(-1px); box-shadow:0 4px 12px rgba(220,53,69,0.3); background:linear-gradient(135deg, #c82333 0%, #a71e2a 100%); }
         .btn-kill:disabled { opacity:0.5; cursor:not-allowed; transform:none; background:#6c757d; box-shadow:none; }
         .btn-kill:disabled:hover { transform:none; box-shadow:none; }
@@ -1980,7 +2000,57 @@ const indexHTML = `<!DOCTYPE html>
             }
         });
         
-        document.addEventListener('DOMContentLoaded', ()=>{ fetch('',{method:'POST', body:new URLSearchParams({action:'interfaces'})}).then(r=>r.json()).then(d=>{ const sel=document.getElementById('source_ip'); if (d && Array.isArray(d.interfaces)){ d.interfaces.forEach(iface=>{ const opt=document.createElement('option'); opt.value=iface.ip; opt.textContent=(iface.name || '') + ' — ' + iface.ip; sel.appendChild(opt); }); } }).catch(()=>{}); refreshLog(); });
+        // Функции для сохранения и восстановления значений формы
+        function saveFormValues() {
+            const formData = {
+                network_range: document.getElementById('network_range').value,
+                source_ip: document.getElementById('source_ip').value,
+                timeout: document.getElementById('timeout').value,
+                show_offline: document.getElementById('show_offline').checked
+            };
+            localStorage.setItem('networkScannerForm', JSON.stringify(formData));
+        }
+        
+        function loadFormValues() {
+            try {
+                const savedData = localStorage.getItem('networkScannerForm');
+                if (savedData) {
+                    const formData = JSON.parse(savedData);
+                    if (formData.network_range) document.getElementById('network_range').value = formData.network_range;
+                    if (formData.source_ip) document.getElementById('source_ip').value = formData.source_ip;
+                    if (formData.timeout) document.getElementById('timeout').value = formData.timeout;
+                    if (formData.show_offline !== undefined) document.getElementById('show_offline').checked = formData.show_offline;
+                }
+            } catch (e) {
+                console.log('Ошибка при загрузке сохраненных значений формы:', e);
+            }
+        }
+        
+        // Добавляем обработчики событий для сохранения значений
+        document.getElementById('network_range').addEventListener('input', saveFormValues);
+        document.getElementById('source_ip').addEventListener('change', saveFormValues);
+        document.getElementById('timeout').addEventListener('change', saveFormValues);
+        document.getElementById('show_offline').addEventListener('change', saveFormValues);
+
+        document.addEventListener('DOMContentLoaded', ()=>{ 
+            fetch('',{method:'POST', body:new URLSearchParams({action:'interfaces'})}).then(r=>r.json()).then(d=>{ 
+                const sel=document.getElementById('source_ip'); 
+                if (d && Array.isArray(d.interfaces)){ 
+                    d.interfaces.forEach(iface=>{ 
+                        const opt=document.createElement('option'); 
+                        opt.value=iface.ip; 
+                        opt.textContent=(iface.name || '') + ' — ' + iface.ip; 
+                        sel.appendChild(opt); 
+                    }); 
+                } 
+                // Загружаем сохраненные значения после загрузки интерфейсов
+                loadFormValues();
+            }).catch(()=>{
+                // Загружаем сохраненные значения даже если интерфейсы не загрузились
+                loadFormValues();
+            }); 
+            refreshLog(); 
+        });
     </script>
 </body>
 </html>`
