@@ -464,6 +464,134 @@ func shutdownComputer(ip string) map[string]interface{} {
 	}
 }
 
+func sendMessageToComputer(ip string, message string) map[string]interface{} {
+	isWindows := runtime.GOOS == "windows"
+
+	if isWindows {
+		// Windows: используем msg.exe для отправки сообщений
+		// Сначала попробуем отправить всем пользователям
+		cmd := exec.Command("msg", "*", "/SERVER:"+ip, message)
+		err := cmd.Run()
+		if err == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено всем пользователям на " + ip,
+			}
+		}
+
+		// Попробуем через PowerShell с Send-MailMessage (если настроен SMTP)
+		psCmd := exec.Command("powershell", "-ExecutionPolicy", "Bypass", "-NoProfile",
+			"-Command", fmt.Sprintf("try { Invoke-Command -ComputerName %s -ScriptBlock { Write-Host '%s' -ForegroundColor Yellow } -ErrorAction Stop; Write-Host 'SUCCESS' } catch { Write-Host 'ERROR:' $_.Exception.Message }", ip, message))
+		psOutput, psErr := psCmd.Output()
+		if psErr == nil && strings.Contains(string(psOutput), "SUCCESS") {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через PowerShell на " + ip,
+			}
+		}
+
+		// Попробуем через net send (если доступен)
+		netCmd := exec.Command("net", "send", ip, message)
+		netOutput, netErr := netCmd.Output()
+		if netErr == nil && !strings.Contains(string(netOutput), "error") {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через net send на " + ip,
+			}
+		}
+
+		// Попробуем через WMIC
+		wmicCmd := exec.Command("wmic", "/node:"+ip, "process", "call", "create", fmt.Sprintf("cmd /c echo %s", message))
+		wmicOutput, wmicErr := wmicCmd.Output()
+		if wmicErr == nil && !strings.Contains(string(wmicOutput), "No Instance(s) Available") {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через WMIC на " + ip,
+			}
+		}
+
+		// Собираем детальную информацию об ошибках
+		var errorDetails []string
+		// err уже проверен выше, добавляем информацию о том, что msg не сработал
+		errorDetails = append(errorDetails, "msg: команда не выполнена")
+		if psErr != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("PowerShell: %v", psErr))
+		}
+		if netErr != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("net send: %v", netErr))
+		}
+		if wmicErr != nil {
+			errorDetails = append(errorDetails, fmt.Sprintf("WMIC: %v", wmicErr))
+		}
+
+		return map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Не удалось отправить сообщение на %s. Возможные причины: отсутствие прав доступа, служба Messenger отключена, или удаленный компьютер недоступен. Детали ошибок: %s", ip, strings.Join(errorDetails, "; ")),
+		}
+	} else {
+		// Linux/Unix: используем различные методы отправки сообщений
+
+		// Попробуем через wall (write all)
+		wallCmd := exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+			fmt.Sprintf("root@%s", ip), fmt.Sprintf("echo '%s' | wall", message))
+		err := wallCmd.Run()
+		if err == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через wall на " + ip,
+			}
+		}
+
+		// Попробуем через write для конкретного пользователя
+		writeCmd := exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+			fmt.Sprintf("root@%s", ip), fmt.Sprintf("who | awk '{print $1}' | head -1 | xargs -I {} write {} '%s'", message))
+		writeErr := writeCmd.Run()
+		if writeErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через write на " + ip,
+			}
+		}
+
+		// Попробуем через notify-send (если доступен)
+		notifyCmd := exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+			fmt.Sprintf("root@%s", ip), fmt.Sprintf("DISPLAY=:0 notify-send 'Network Scanner' '%s'", message))
+		notifyErr := notifyCmd.Run()
+		if notifyErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через notify-send на " + ip,
+			}
+		}
+
+		// Попробуем через rsh
+		rshCmd := exec.Command("rsh", ip, fmt.Sprintf("echo '%s' | wall", message))
+		rshErr := rshCmd.Run()
+		if rshErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через RSH на " + ip,
+			}
+		}
+
+		// Попробуем через echo в терминал
+		echoCmd := exec.Command("ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
+			fmt.Sprintf("root@%s", ip), fmt.Sprintf("echo '%s' > /dev/tty", message))
+		echoErr := echoCmd.Run()
+		if echoErr == nil {
+			return map[string]interface{}{
+				"success": true,
+				"message": "Сообщение отправлено через echo на " + ip,
+			}
+		}
+
+		return map[string]interface{}{
+			"success": false,
+			"error":   fmt.Sprintf("Не удалось отправить сообщение на %s. Возможные причины: отсутствие SSH доступа, отсутствие активных пользователей, или недостаточно прав. Ошибки: wall=%v, write=%v, notify-send=%v, rsh=%v, echo=%v", ip, err, writeErr, notifyErr, rshErr, echoErr),
+		}
+	}
+}
+
 // WebSocket upgrader для VNC прокси
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
@@ -778,6 +906,36 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 				logEvent("KILL_PROCESS_SUCCESS", map[string]interface{}{"ip": ip, "pid": pid, "process_name": processName, "message": result["message"]})
 			} else {
 				logEvent("KILL_PROCESS_ERROR", map[string]interface{}{"ip": ip, "pid": pid, "process_name": processName, "error": result["error"]})
+			}
+			json.NewEncoder(w).Encode(result)
+			return
+		case "send_message":
+			ip := r.FormValue("ip")
+			message := r.FormValue("message")
+
+			if ip == "" || message == "" {
+				json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "IP адрес и сообщение обязательны"})
+				return
+			}
+
+			// Сначала проверяем, что компьютер онлайн
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+
+			res := pingHost(ctx, ip, 2000, "")
+			if res.Status != "online" {
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"error":   fmt.Sprintf("Компьютер %s недоступен. Статус: %s", ip, res.Status),
+				})
+				return
+			}
+
+			result := sendMessageToComputer(ip, message)
+			if result["success"].(bool) {
+				logEvent("SEND_MESSAGE_SUCCESS", map[string]interface{}{"ip": ip, "message": message, "result_message": result["message"]})
+			} else {
+				logEvent("SEND_MESSAGE_ERROR", map[string]interface{}{"ip": ip, "message": message, "error": result["error"]})
 			}
 			json.NewEncoder(w).Encode(result)
 			return
@@ -1346,6 +1504,9 @@ const indexHTML = `<!DOCTYPE html>
         .btn-processes { background:linear-gradient(135deg, #28a745 0%, #1e7e34 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
         .btn-processes:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
         .btn-processes:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
+        .btn-message { background:linear-gradient(135deg, #17a2b8 0%, #138496 100%); color:white; border:none; padding:8px 16px; border-radius:6px; font-size:14px; font-weight:600; cursor:pointer; transition:transform 0.2s, box-shadow 0.2s; }
+        .btn-message:hover { transform:translateY(-1px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .btn-message:disabled { opacity:0.6; cursor:not-allowed; transform:none; }
         .loading { text-align:center; padding:40px; color:#666; }
         .alert { padding:15px; border-radius:8px; margin-bottom:20px; }
         .alert-error { background:#f8d7da; color:#721c24; border:1px solid #f5c6cb; }
@@ -1484,6 +1645,27 @@ const indexHTML = `<!DOCTYPE html>
         </div>
     </div>
     
+    <!-- Modal для отправки сообщений -->
+    <div id="messageModal" class="modal">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3 class="modal-title">💬 Отправить сообщение на <span id="messageComputerIP"></span></h3>
+                <button class="modal-close" onclick="closeMessageModal()">&times;</button>
+            </div>
+            <div class="modal-body" style="padding: 30px; display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 200px;">
+                <div class="form-group" style="width: 100%; max-width: 500px;">
+                    <label for="messageText" style="text-align: center; display: block; margin-bottom: 15px;">Текст сообщения:</label>
+                    <textarea id="messageText" rows="4" style="width: 100%; padding: 12px; border: 2px solid #e1e5e9; border-radius: 8px; text-align: center; font-size: 16px; resize: vertical;" placeholder="Введите сообщение для отправки на компьютер..."></textarea>
+                </div>
+                <div style="margin-top: 20px; text-align: center;">
+                    <button class="btn" onclick="sendMessage()" id="sendMessageBtn">📤 Отправить сообщение</button>
+                    <button class="btn btn-secondary" onclick="closeMessageModal()">❌ Отмена</button>
+                </div>
+                <div id="messageResult" style="margin-top: 15px;"></div>
+            </div>
+        </div>
+    </div>
+    
     <script>
         let scanData = null;
         let currentEventSource = null;
@@ -1581,6 +1763,9 @@ const indexHTML = `<!DOCTYPE html>
             var processesButton = result.status === 'online' ? 
                 '<button class="btn-processes" onclick="showProcesses(\'' + result.ip + '\')" title="Показать процессы">📋 Процессы</button>' : 
                 '<button class="btn-processes" disabled title="Компьютер недоступен">📋 Процессы</button>';
+            var messageButton = result.status === 'online' ? 
+                '<button class="btn-message" onclick="showMessageModal(\'' + result.ip + '\')" title="Отправить сообщение">💬 Сообщение</button>' : 
+                '<button class="btn-message" disabled title="Компьютер недоступен">💬 Сообщение</button>';
             var shutdownButton = result.status === 'online' ? 
                 '<button class="btn-shutdown" onclick="shutdownComputer(\'' + result.ip + '\')" title="Выключить компьютер">🔌 Выключить</button>' : 
                 '<button class="btn-shutdown" disabled title="Компьютер недоступен">🔌 Выключить</button>';
@@ -1594,6 +1779,7 @@ const indexHTML = `<!DOCTYPE html>
                     timeHtml +
                     vncButton +
                     processesButton +
+                    messageButton +
                     shutdownButton +
                 '</div>';
             list.appendChild(item);
@@ -1994,9 +2180,109 @@ const indexHTML = `<!DOCTYPE html>
         
         // Закрытие модального окна при клике вне его
         window.addEventListener('click', function(event) {
-            const modal = document.getElementById('processModal');
-            if (event.target === modal) {
+            const processModal = document.getElementById('processModal');
+            const messageModal = document.getElementById('messageModal');
+            if (event.target === processModal) {
                 closeProcessModal();
+            }
+            if (event.target === messageModal) {
+                closeMessageModal();
+            }
+        });
+        
+        // Функции для работы с модальным окном сообщений
+        let currentMessageIP = '';
+        
+        function showMessageModal(ip) {
+            const modal = document.getElementById('messageModal');
+            const messageComputerIP = document.getElementById('messageComputerIP');
+            const messageText = document.getElementById('messageText');
+            const messageResult = document.getElementById('messageResult');
+            
+            currentMessageIP = ip;
+            messageComputerIP.textContent = ip;
+            messageText.value = '';
+            messageResult.innerHTML = '';
+            
+            modal.style.display = 'block';
+            
+            // Фокусируемся на поле ввода
+            setTimeout(() => {
+                messageText.focus();
+            }, 100);
+        }
+        
+        function closeMessageModal() {
+            const modal = document.getElementById('messageModal');
+            modal.style.display = 'none';
+            currentMessageIP = '';
+        }
+        
+        function sendMessage() {
+            const messageText = document.getElementById('messageText');
+            const sendMessageBtn = document.getElementById('sendMessageBtn');
+            const messageResult = document.getElementById('messageResult');
+            
+            const message = messageText.value.trim();
+            
+            if (!message) {
+                messageResult.innerHTML = '<div class="alert alert-error">Пожалуйста, введите текст сообщения</div>';
+                return;
+            }
+            
+            if (!currentMessageIP) {
+                messageResult.innerHTML = '<div class="alert alert-error">Ошибка: IP адрес не указан</div>';
+                return;
+            }
+            
+            // Показываем индикатор загрузки
+            sendMessageBtn.disabled = true;
+            sendMessageBtn.textContent = '⏳ Отправка...';
+            messageResult.innerHTML = '<div class="loading">Отправка сообщения на ' + currentMessageIP + '...</div>';
+            
+            const formData = new FormData();
+            formData.append('action', 'send_message');
+            formData.append('ip', currentMessageIP);
+            formData.append('message', message);
+            
+            fetch('', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.success) {
+                    messageResult.innerHTML = '<div class="alert alert-success"><strong>Успешно!</strong> ' + (data.message || 'Сообщение отправлено') + '</div>';
+                    messageText.value = '';
+                } else {
+                    const errorMsg = data.error || 'Неизвестная ошибка';
+                    messageResult.innerHTML = '<div class="alert alert-error"><strong>Ошибка:</strong> ' + errorMsg + '</div>';
+                }
+            })
+            .catch(error => {
+                messageResult.innerHTML = '<div class="alert alert-error"><strong>Ошибка:</strong> ' + error.message + '</div>';
+            })
+            .finally(() => {
+                sendMessageBtn.disabled = false;
+                sendMessageBtn.textContent = '📤 Отправить сообщение';
+            });
+        }
+        
+        // Обработка нажатия Enter в поле сообщения
+        document.addEventListener('DOMContentLoaded', function() {
+            const messageText = document.getElementById('messageText');
+            if (messageText) {
+                messageText.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' && e.ctrlKey) {
+                        e.preventDefault();
+                        sendMessage();
+                    }
+                });
             }
         });
         
